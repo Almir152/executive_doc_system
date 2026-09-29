@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+storage/app.db
+storage/internal_archive/*
+storage/packages/*
+storage/backups/*
+build/
+dist/
+*.spec
+.pytest_cache/
