@@ -22,7 +22,7 @@ from app.core import domain
 logger = logging.getLogger(__name__)
 
 # Текущая версия схемы. Увеличивать при добавлении миграции.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Справочники и формы, которые миграция создаёт сама, до переноса данных.
 # Миграция не должна зависеть от того, что create_all уже отработал.
@@ -262,6 +262,7 @@ CREATE TABLE document_versions__new (
     is_actual BOOLEAN NOT NULL,
     created_at DATETIME NOT NULL,
     PRIMARY KEY (id),
+    CONSTRAINT uq_document_version_no UNIQUE (document_id, version_no),
     FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE RESTRICT,
     FOREIGN KEY(form_version_id) REFERENCES normative_forms (id) ON DELETE RESTRICT
 )
@@ -544,13 +545,31 @@ def migration_003(conn) -> None:
     cols = table_columns(conn, "document_versions")
     if "document_id" not in cols:
         return
-    # Проверять текст DDL нельзя: RESTRICT есть и у второго внешнего ключа
-    # (form_version_id), и на незащищённой таблице проверка прошла бы. Смотрим
-    # действие именно по колонке document_id.
+
+    # Решение принимается по модели, а не по одному признаку. Ранний выход
+    # «FK уже RESTRICT» пропускал восстановление UNIQUE: таблица, пересобранная
+    # прежней версией этой миграции без ограничения, считалась готовой.
+    needs_rebuild = False
     for fk in conn.execute("PRAGMA foreign_key_list(document_versions)").fetchall():
         # (id, seq, table, from, to, on_update, on_delete, match)
-        if fk[3] == "document_id" and (fk[6] or "").upper() == "RESTRICT":
-            return  # уже защищена
+        if fk[3] == "document_id" and (fk[6] or "").upper() != "RESTRICT":
+            needs_rebuild = True
+    if _missing_unique(conn, "document_versions", ("document_id", "version_no")):
+        needs_rebuild = True
+    if not needs_rebuild:
+        return
+
+    duplicates = conn.execute(
+        "SELECT document_id, version_no, count(*) FROM document_versions "
+        "GROUP BY document_id, version_no HAVING count(*) > 1"
+    ).fetchall()
+    if duplicates:
+        raise RuntimeError(
+            "Нельзя восстановить ограничение уникальности версий: в базе "
+            f"{len(duplicates)} повторов (document_id, version_no), "
+            f"начиная с {duplicates[0][:2]}. Данные требуют разбора оператором; "
+            "ничего не изменено."
+        )
 
     _begin_rebuild(conn, "document_versions", DOCUMENT_VERSIONS_V3_DDL)
     conn.execute(
@@ -565,6 +584,57 @@ def migration_003(conn) -> None:
     create_indexes(conn)
 
 
+def _missing_unique(conn, table: str, columns: tuple) -> bool:
+    """Есть ли уникальный индекс, покрывающий все указанные колонки."""
+    for index in conn.execute(f"PRAGMA index_list({table})").fetchall():
+        # (seq, name, unique, origin, partial)
+        if not index[2]:
+            continue
+        indexed = {
+            r[2] for r in conn.execute(f"PRAGMA index_info({index[1]})").fetchall()
+        }
+        if set(columns) <= indexed:
+            return False
+    return True
+
+
+def migration_004(conn) -> None:
+    """Вернуть уникальность номера версии документа.
+
+    Миграция 003 пересобирала таблицу, и её DDL не содержал ограничения
+    UNIQUE (document_id, version_no), которое есть в модели. Ограничение
+    пропало у всех, кто обновился до 003, а версия схемы при этом стала 3,
+    поэтому исправлять пришлось отдельной миграцией (ТЗ п.85).
+    """
+    if not table_exists(conn, "document_versions"):
+        return
+    cols = table_columns(conn, "document_versions")
+    if "document_id" not in cols or "version_no" not in cols:
+        return
+    if not _missing_unique(conn, "document_versions", ("document_id", "version_no")):
+        return
+
+    duplicates = conn.execute(
+        "SELECT document_id, version_no, count(*) FROM document_versions "
+        "GROUP BY document_id, version_no HAVING count(*) > 1"
+    ).fetchall()
+    if duplicates:
+        raise RuntimeError(
+            "Нельзя восстановить ограничение уникальности версий: в базе "
+            f"{len(duplicates)} повторов (document_id, version_no), "
+            f"начиная с {duplicates[0][:2]}. Данные требуют разбора оператором; "
+            "ничего не изменено."
+        )
+
+    # Уникальный индекс добавляется без пересборки таблицы: ограничение
+    # уникальности в SQLite выражается именно индексом, и ALTER TABLE
+    # здесь не нужен, а значит не затронуты ни данные, ни внешние ключи.
+    conn.execute(
+        "CREATE UNIQUE INDEX uq_document_version_no "
+        "ON document_versions (document_id, version_no)"
+    )
+
+
 # =====================================================================
 # Реестр миграций
 # =====================================================================
@@ -573,6 +643,7 @@ MIGRATIONS = [
     (1, "legacy_to_stage1", migration_001),
     (2, "add_lookup_indexes", migration_002),
     (3, "protect_issued_document_versions", migration_003),
+    (4, "restore_version_number_uniqueness", migration_004),
 ]
 
 
@@ -678,13 +749,73 @@ def schema_problems(conn) -> list[str]:
                 problems.append(
                     f"в таблице {table.name} нет колонки {column.name}"
                 )
-        for fk in table.foreign_keys:
-            target_table = fk.target_fullname.split(".")[0]
-            if target_table not in existing:
-                problems.append(
-                    f"в таблице {table.name} внешний ключ ссылается "
-                    f"на отсутствующую таблицу {target_table}"
-                )
+        problems.extend(_foreign_key_problems(conn, table, actual))
+        problems.extend(_unique_problems(conn, table, actual))
+    return problems
+
+
+def _foreign_key_problems(conn, table, columns: set) -> list[str]:
+    """Сверить внешние ключи: не только цели, но и действия при удалении.
+
+    Проверки только имён таблиц недостаточно. Таблица, потерявшая все
+    внешние ключи, проходит такую сверку: колонки на месте, а защиты нет.
+    На document_versions это означало бы, что RESTRICT, о котором заявлено
+    в ТЗ п.85, просто не существует, и удаление документа стирает выпуск.
+    """
+    problems: list[str] = []
+    actual: dict[tuple[str, str], str] = {}
+    for fk in conn.execute(f"PRAGMA foreign_key_list({table.name})").fetchall():
+        # (id, seq, table, from, to, on_update, on_delete, match)
+        actual[(fk[3], fk[2])] = (fk[6] or "").upper()
+    for fk in table.foreign_keys:
+        target_table, target_column = fk.target_fullname.split(".")
+        from_column = fk.parent.name
+        if from_column not in columns:
+            continue  # колонка уже отмечена выше
+        expected = (fk.ondelete or "").upper()
+        got = actual.get((from_column, target_table))
+        if got is None:
+            problems.append(
+                f"в таблице {table.name} нет внешнего ключа "
+                f"{from_column} -> {target_table}"
+            )
+        elif expected and got != expected:
+            problems.append(
+                f"в таблице {table.name} внешний ключ {from_column} -> "
+                f"{target_table} удаляет по {got}, а ожидалось {expected}"
+            )
+    return problems
+
+
+def _unique_problems(conn, table, columns: set) -> list[str]:
+    """Сверить ограничения уникальности.
+
+    Без них, например, разрешаются два выпуска с одинаковым номером версии
+    одного документа, и history становится неоднозначной (ТЗ п.85).
+    """
+    problems: list[str] = []
+    for constraint in table.constraints:
+        if constraint.__class__.__name__ != "UniqueConstraint":
+            continue
+        names = [c.name for c in constraint.columns if c.name in columns]
+        if len(names) != len(constraint.columns):
+            continue  # колонка отсутствует, отмечено выше
+        covered = False
+        for index in conn.execute(f"PRAGMA index_list({table.name})").fetchall():
+            # (seq, name, unique, origin, partial)
+            if not index[2]:
+                continue
+            indexed = {
+                r[2] for r in conn.execute(f"PRAGMA index_info({index[1]})").fetchall()
+            }
+            if set(names) <= indexed:
+                covered = True
+                break
+        if not covered:
+            problems.append(
+                f"в таблице {table.name} нет уникальности "
+                f"({', '.join(names)})"
+            )
     return problems
 
 

@@ -412,11 +412,15 @@ class Document(Base):
 
     # cascade намеренно без delete: ORM удалил бы выпущенные версии раньше
     # родителя, и внешний ключ RESTRICT (ТЗ п.85) не успел бы сработать.
-    # Защиту обеспечивает сама БД.
+    # passive_deletes: без него ORM шлёт UPDATE document_id=NULL, и удаление
+    # отклонялось бы только потому, что колонка NOT NULL. Это «испортить и
+    # упасть», а не «отклонить»: с nullable-колонкой версия осиротела бы.
+    # С удалением разбирается БД — она и должна решать (ТЗ п.85).
     versions = relationship(
         "DocumentVersion",
         back_populates="document",
         cascade="save-update, merge",
+        passive_deletes=True,
         order_by="DocumentVersion.version_no",
     )
     archive_links = relationship(

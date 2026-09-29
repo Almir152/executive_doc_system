@@ -690,9 +690,11 @@ def test_migration_of_already_migrated_database_adds_only_new_steps(tmp_path):
     plain.close()
 
     applied = apply_migrations(own_engine)
-    assert applied == ["add_lookup_indexes", "protect_issued_document_versions"], (
-        f"неожиданный набор шагов: {applied}"
-    )
+    assert applied == [
+        "add_lookup_indexes",
+        "protect_issued_document_versions",
+        "restore_version_number_uniqueness",
+    ], f"неожиданный набор шагов: {applied}"
 
     raw = own_engine.raw_connection()
     try:
@@ -1028,7 +1030,9 @@ def test_migration_003_protects_issued_versions_of_legacy_v2_database(tmp_path):
     finally:
         raw.close()
 
-    assert apply_migrations(own_engine) == ["protect_issued_document_versions"]
+    assert apply_migrations(own_engine) == [
+        "protect_issued_document_versions", "restore_version_number_uniqueness",
+    ]
 
     raw = sqlite3.connect(db_path)
     try:
@@ -1167,3 +1171,346 @@ def test_operator_sees_schema_mismatch_reason_on_startup(
     text = gui_support["critical"][0][2]
     assert "form_version_id" in text, "в сообщении нет сути проблемы"
     assert "backups" in text, "в сообщении нет подсказки, что делать"
+
+
+def test_schema_check_detects_lost_foreign_keys_and_uniqueness(db):
+    """Сверка замечает пропажу внешних ключей и уникальности.
+
+    Проверки только имён таблиц и колонок недостаточно: таблица может
+    сохранить форму, потеряв все внешние ключи. Для document_versions это
+    означало бы, что защита выпуска от каскада (ТЗ п.85) не существует,
+    и сверка молчала бы.
+    """
+    from app.db.database import engine
+    from app.db.migrations import schema_problems
+
+    raw = engine.raw_connection()
+    try:
+        raw.execute("PRAGMA foreign_keys=OFF")
+        raw.execute("BEGIN")
+        raw.execute(
+            """
+            CREATE TABLE document_versions__plain (
+                id INTEGER NOT NULL, document_id INTEGER NOT NULL,
+                version_no INTEGER NOT NULL, form_version_id INTEGER,
+                payload JSON NOT NULL, issued_at DATETIME,
+                is_actual BOOLEAN NOT NULL, created_at DATETIME NOT NULL,
+                PRIMARY KEY (id)
+            )
+            """
+        )
+        raw.execute("DROP TABLE document_versions")
+        raw.execute("ALTER TABLE document_versions__plain RENAME TO document_versions")
+        raw.execute("COMMIT")
+    except Exception:
+        raw.execute("ROLLBACK")
+        raise
+    finally:
+        raw.execute("PRAGMA foreign_keys=ON")
+        raw.close()
+
+    with engine.connect() as conn:
+        problems = schema_problems(conn)
+    assert any(
+        "внешнего ключа document_id -> documents" in p for p in problems
+    ), f"пропажа внешнего ключа не замечена: {problems}"
+    assert any(
+        "внешнего ключа form_version_id -> normative_forms" in p for p in problems
+    ), problems
+    assert any("нет уникальности" in p for p in problems), problems
+
+
+def test_schema_check_detects_wrong_foreign_key_action(db):
+    """Сверка замечает внешний ключ, у которого не то действие удаления.
+
+    Особенно важно для RESTRICT на document_versions: CASCADE вместо него
+    означает возврат к тихой потере выпущенных версий.
+    """
+    from app.db.database import engine
+    from app.db.migrations import schema_problems
+
+    raw = engine.raw_connection()
+    try:
+        raw.execute("PRAGMA foreign_keys=OFF")
+        raw.execute("BEGIN")
+        raw.execute(
+            """
+            CREATE TABLE document_versions__cascade (
+                id INTEGER NOT NULL, document_id INTEGER NOT NULL,
+                version_no INTEGER NOT NULL, form_version_id INTEGER,
+                payload JSON NOT NULL, issued_at DATETIME,
+                is_actual BOOLEAN NOT NULL, created_at DATETIME NOT NULL,
+                PRIMARY KEY (id),
+                UNIQUE (document_id, version_no),
+                FOREIGN KEY(document_id) REFERENCES documents (id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(form_version_id) REFERENCES normative_forms (id)
+                    ON DELETE RESTRICT
+            )
+            """
+        )
+        raw.execute(
+            "INSERT INTO document_versions__cascade "
+            "SELECT id, document_id, version_no, form_version_id, payload, "
+            "issued_at, is_actual, created_at FROM document_versions"
+        )
+        raw.execute("DROP TABLE document_versions")
+        raw.execute(
+            "ALTER TABLE document_versions__cascade RENAME TO document_versions"
+        )
+        raw.execute("COMMIT")
+    except Exception:
+        raw.execute("ROLLBACK")
+        raise
+    finally:
+        raw.execute("PRAGMA foreign_keys=ON")
+        raw.close()
+
+    with engine.connect() as conn:
+        problems = schema_problems(conn)
+    assert any(
+        "удаляет по CASCADE" in p and "ожидалось RESTRICT" in p for p in problems
+    ), f"неверное действие внешнего ключа не замечено: {problems}"
+
+
+def test_issued_version_survives_because_database_rejects_delete(db, project):
+    """Отказ даёт сама БД, а не побочный эффект ограничения NOT NULL.
+
+    Раньше ORM шёл с UPDATE document_id=NULL, и удаление отклонялось только
+    потому, что колонка NOT NULL. Это «испортить и упасть»: с nullable
+    колонкой версия осиротела бы. Теперь отказ приходит от DELETE.
+    """
+    from sqlalchemy import event
+    from sqlalchemy.exc import IntegrityError
+
+    from app.config import utcnow
+
+    document = Document(project_id=project.id, doc_type="АОСР", number="12")
+    db.add(document)
+    db.commit()
+    db.add(
+        DocumentVersion(
+            document_id=document.id, version_no=1,
+            payload={"номер": "12"}, issued_at=utcnow(), is_actual=True,
+        )
+    )
+    db.commit()
+
+    statements: list[str] = []
+    engine = db.get_bind()
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(" ".join(statement.split()))
+
+    try:
+        db.delete(document)
+        with pytest.raises(IntegrityError, match="FOREIGN KEY"):
+            db.commit()
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert not any(
+        s.upper().startswith("UPDATE DOCUMENT_VERSIONS") for s in statements
+    ), f"ORM попытался испортить версию перед отказом: {statements}"
+    assert any("DELETE FROM DOCUMENTS" in s.upper() for s in statements), statements
+
+
+def _set_version(engine, version: int) -> None:
+    """Проставить user_version, как если бы базу обновила прежняя версия."""
+    from app.db.migrations import set_user_version
+
+    raw = engine.raw_connection()
+    try:
+        set_user_version(raw, version)
+    finally:
+        raw.close()
+
+
+def _rebuild_document_versions(engine, *, with_unique: bool) -> None:
+    """Пересоздать document_versions, с ограничением уникальности или без.
+
+    Нужно, чтобы получить состояние, оставляемое пересборкой таблицы:
+    UNIQUE, объявленный в CREATE TABLE, становится автоиндексом, который
+    нельзя удалить обычным DROP INDEX.
+    """
+    unique = "UNIQUE (document_id, version_no)," if with_unique else ""
+    raw = engine.raw_connection()
+    try:
+        raw.execute("PRAGMA foreign_keys=OFF")
+        raw.execute("BEGIN")
+        raw.execute(
+            f"""
+            CREATE TABLE document_versions__manual (
+                id INTEGER NOT NULL, document_id INTEGER NOT NULL,
+                version_no INTEGER NOT NULL, form_version_id INTEGER,
+                payload JSON NOT NULL, issued_at DATETIME,
+                is_actual BOOLEAN NOT NULL, created_at DATETIME NOT NULL,
+                PRIMARY KEY (id), {unique}
+                FOREIGN KEY(document_id) REFERENCES documents (id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(form_version_id) REFERENCES normative_forms (id)
+                    ON DELETE RESTRICT
+            )
+            """
+        )
+        raw.execute(
+            "INSERT INTO document_versions__manual "
+            "SELECT id, document_id, version_no, form_version_id, payload, "
+            "issued_at, is_actual, created_at FROM document_versions"
+        )
+        raw.execute("DROP TABLE document_versions")
+        raw.execute(
+            "ALTER TABLE document_versions__manual RENAME TO document_versions"
+        )
+        raw.execute("COMMIT")
+    except Exception:
+        raw.execute("ROLLBACK")
+        raise
+    finally:
+        raw.execute("PRAGMA foreign_keys=ON")
+        raw.close()
+
+
+def test_migration_004_restores_version_number_uniqueness(db, project):
+    """Ограничение уникальности номера версии восстанавливается.
+
+    Миграция 003 пересобирала таблицу и теряла UNIQUE, объявленный в модели.
+    Обнаружить это можно было только сверкой схемы: колонки на месте, а
+    ограничения нет, поэтому два выпуска с одинаковым номером проходили.
+    """
+    from app.config import utcnow
+    from app.db.database import engine
+    from app.db.migrations import _missing_unique, apply_migrations
+
+    document = Document(project_id=project.id, doc_type="АОСР", number="12")
+    db.add(document)
+    db.commit()
+    db.add(
+        DocumentVersion(
+            document_id=document.id, version_no=1,
+            payload={"номер": "12"}, issued_at=utcnow(), is_actual=True,
+        )
+    )
+    db.commit()
+
+    # Снимаем ограничение — состояние после пересборки таблицы. UNIQUE,
+    # объявленный в самой таблице, является автоиндексом, и DROP INDEX для
+    # него запрещён: единственный способ убрать — пересобрать таблицу.
+    _rebuild_document_versions(engine, with_unique=False)
+    _set_version(engine, 3)  # состояние после обновления на 003
+
+    raw = engine.raw_connection()
+    try:
+        assert _missing_unique(
+            raw, "document_versions", ("document_id", "version_no")
+        ), "подготовка не сняла ограничение"
+    finally:
+        raw.close()
+
+    assert "restore_version_number_uniqueness" in apply_migrations(engine)
+
+    raw = engine.raw_connection()
+    try:
+        assert not _missing_unique(
+            raw, "document_versions", ("document_id", "version_no")
+        ), "ограничение не восстановлено"
+    finally:
+        raw.close()
+
+    assert apply_migrations(engine) == [], "миграция 004 не идемпотентна"
+
+    db.expire_all()
+    assert db.get(DocumentVersion, 1) is not None, "выпуск потерян при миграции"
+    db.add(
+        DocumentVersion(
+            document_id=document.id, version_no=1,
+            payload={"повтор": True}, is_actual=False,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db.commit()
+    db.rollback()
+
+
+def test_migration_004_refuses_to_guess_when_duplicates_exist(db, project):
+    """При повторах в данных ограничение не ставится молча.
+
+    Иначе оператор получил бы отказ, не понимая причины, либо потерял бы
+    данные. Сообщение обязано называть, что именно мешает.
+    """
+    from app.db.database import engine
+    from app.db.migrations import apply_migrations
+
+    document = Document(project_id=project.id, doc_type="АОСР", number="12")
+    db.add(document)
+    db.commit()
+    db.add(
+        DocumentVersion(
+            document_id=document.id, version_no=1,
+            payload={"номер": "12"}, is_actual=False,
+        )
+    )
+    db.commit()
+
+    # Порча вносится в обход ограничения: сначала снимается оно, и только
+    # потом появляется повтор. Так БД приходит к оператору извне, а не
+    # через собственный код, который ограничение не дал бы обойти.
+    _rebuild_document_versions(engine, with_unique=False)
+    _set_version(engine, 3)
+    db.add(
+        DocumentVersion(
+            document_id=document.id, version_no=1,
+            payload={"повтор": True}, is_actual=False,
+        )
+    )
+    db.commit()
+
+    with pytest.raises(RuntimeError, match="повторов"):
+        apply_migrations(engine)
+
+
+def test_migrations_alone_restore_uniqueness_without_model_help(db, project):
+    """Миграции обязаны восстанавливать ограничение сами.
+
+    create_all создаёт автоиндекс у только что созданной таблицы, поэтому
+    сверка, идущая после него, увидела бы уже исправленную БД и пропустила
+    бы миграцию, оставив ограничение ненавязанным. Миграции проверяются на
+    БД, где таблица создана вручную, без участия create_all.
+    """
+    from app.db.migrations import _missing_unique, apply_migrations
+
+    document = Document(project_id=project.id, doc_type="АОСР", number="12")
+    db.add(document)
+    db.commit()
+    db.add(
+        DocumentVersion(
+            document_id=document.id, version_no=1,
+            payload={"номер": "12"}, is_actual=True,
+        )
+    )
+    db.commit()
+
+    # Таблица собирается вручную, ровно как её оставляет пересборка.
+    engine = db.get_bind()
+    _rebuild_document_versions(engine, with_unique=False)
+    _set_version(engine, 3)
+
+    conn = engine.raw_connection()
+    try:
+        assert _missing_unique(
+            conn, "document_versions", ("document_id", "version_no")
+        ), "подготовка не сняла ограничение"
+    finally:
+        conn.close()
+
+    # Миграция 004 обязана поставить его, не дожидаясь create_all.
+    assert "restore_version_number_uniqueness" in apply_migrations(engine)
+
+    conn = engine.raw_connection()
+    try:
+        assert not _missing_unique(
+            conn, "document_versions", ("document_id", "version_no")
+        ), "миграции не восстановили уникальность без create_all"
+    finally:
+        conn.close()
