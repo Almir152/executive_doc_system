@@ -629,6 +629,65 @@ def apply_migrations(engine, target: int = SCHEMA_VERSION) -> list[str]:
     return applied
 
 
+def verify_schema(engine) -> None:
+    """Убедиться, что БД соответствует модели, иначе остановить запуск.
+
+    Миграции узнают унаследованную схему по именам таблиц и колонок, поэтому
+    база, у которой имена уже новые, а колонки старые, проходит мимо них
+    без следа: миграция рапортует об успехе, а программа падает позже, при
+    первом обращении к документу. Единственная надёжная защита — сравнить
+    фактическую схему с моделью после создания таблиц.
+    """
+    raw = engine.raw_connection()
+    try:
+        problems = schema_problems(raw)
+    finally:
+        raw.close()
+    if problems:
+        raise RuntimeError(
+            "Схема базы не соответствует программе:\n  - "
+            + "\n  - ".join(problems)
+            + "\nОбновление остановлено, чтобы не работать с повреждёнными данными. "
+            "Сообщите текст оператору и верните резервную копию из storage/backups."
+        )
+
+
+def schema_problems(conn) -> list[str]:
+    """Расхождения фактической схемы с моделями. Пустой список — всё на месте.
+
+    Принимает любой вариант подключения: приводится к sqlite3, как остальные
+    функции проверки этого модуля.
+    """
+    from app.db.models import Base
+
+    conn = _raw(conn)
+    problems: list[str] = []
+    existing = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing:
+            problems.append(f"отсутствует таблица {table.name}")
+            continue
+        actual = table_columns(conn, table.name)
+        for column in table.columns:
+            if column.name not in actual:
+                problems.append(
+                    f"в таблице {table.name} нет колонки {column.name}"
+                )
+        for fk in table.foreign_keys:
+            target_table = fk.target_fullname.split(".")[0]
+            if target_table not in existing:
+                problems.append(
+                    f"в таблице {table.name} внешний ключ ссылается "
+                    f"на отсутствующую таблицу {target_table}"
+                )
+    return problems
+
+
 def _raw(conn):
     """Довести любой вариант подключения до DBAPI-соединения sqlite3.
 

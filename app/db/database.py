@@ -156,6 +156,11 @@ def init_db() -> dict:
 
     applied = migrations.apply_migrations(engine)
     Base.metadata.create_all(bind=engine)
+    # Сверка идёт после создания таблиц: на пустой базе до create_all
+    # проверять нечего, и она валила бы первый запуск. Миграции узнают
+    # унаследованную схему по именам таблиц, поэтому база с новыми именами
+    # и старыми колонками проходит мимо них без следа (ТЗ п.97).
+    migrations.verify_schema(engine)
     journal_ok = _restore_delete_journal()
     if not journal_ok:
         logger.error(

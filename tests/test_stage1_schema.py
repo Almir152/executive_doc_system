@@ -1049,3 +1049,121 @@ def test_migration_003_protects_issued_versions_of_legacy_v2_database(tmp_path):
         raw.close()
 
     assert apply_migrations(own_engine) == [], "миграция 003 не идемпотентна"
+
+
+# =====================================================================
+# СВЕРКА СХЕМЫ С МОДЕЛЬЮ (ТЗ п.97)
+# =====================================================================
+
+
+def test_schema_mismatch_stops_startup_with_readable_report(db):
+    """База с новыми именами и старыми колонками останавливает запуск.
+
+    Миграции узнают унаследованную схему по именам таблиц, поэтому такая
+    база проходит мимо них без следа. Без сверки с моделью программа
+    рапортовала бы об успехе и упала бы позже, при первом обращении.
+    """
+    from app.db.database import engine, init_db
+    from app.db.migrations import schema_problems, verify_schema
+
+    verify_schema(engine)  # на только что созданной схеме расхождений нет
+
+    # Таблица пересоздаётся копированием, а не переименованием: при RENAME
+    # SQLite переписывает ссылки на documents во всех остальных таблицах,
+    # и следующая фикстура падает на отсутствующей documents__keep.
+    # foreign_keys выключен на время подмены, иначе DROP не пройдёт.
+    raw = engine.raw_connection()
+    try:
+        raw.execute("PRAGMA foreign_keys=OFF")
+        raw.execute("BEGIN")
+        raw.execute(
+            """
+            CREATE TABLE documents__stale (
+                id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL,
+                doc_type VARCHAR NOT NULL, number VARCHAR NOT NULL,
+                created_at DATETIME NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects (id) ON DELETE CASCADE
+            )
+            """
+        )
+        raw.execute("DROP TABLE documents")
+        raw.execute("ALTER TABLE documents__stale RENAME TO documents")
+        raw.execute("COMMIT")
+    except Exception:
+        raw.execute("ROLLBACK")
+        raise
+    finally:
+        raw.execute("PRAGMA foreign_keys=ON")
+        raw.close()
+
+    with engine.connect() as conn:
+        problems = schema_problems(conn)
+    assert problems, "расхождение схемы не обнаружено"
+    assert any("documents" in p and "form_version_id" in p for p in problems), (
+        f"не назван конкретный столбец: {problems}"
+    )
+
+    with pytest.raises(RuntimeError, match="не соответствует программе"):
+        verify_schema(engine)
+
+    # Проверяется именно init_db — тот путь, который проходит программа при
+    # запуске. Ранняя версия теста звала verify_schema напрямую и потому
+    # не замечала, что отключение проверки в init_db не ловится.
+    with pytest.raises(RuntimeError, match="не соответствует программе"):
+        init_db()
+
+
+def test_schema_problems_empty_on_healthy_database(db):
+    """Здоровая база не должна давать ложных срабатываний проверки."""
+    from app.db.database import engine
+    from app.db.migrations import schema_problems, verify_schema
+
+    with engine.connect() as conn:
+        assert schema_problems(conn) == []
+    verify_schema(engine)
+
+
+def test_schema_problems_detect_missing_table_and_dangling_fk(db):
+    """Проверка замечает и отсутствующую таблицу, и внешний ключ в никуда."""
+    from app.db.database import engine
+    from app.db.migrations import schema_problems
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE history_events")
+    with engine.connect() as conn:
+        problems = schema_problems(conn)
+    assert any("history_events" in p for p in problems), problems
+
+
+@pytest.mark.gui
+def test_operator_sees_schema_mismatch_reason_on_startup(
+    db, monkeypatch, gui_support, qapp
+):
+    """При сбое схемы оператор видит причину, а не молчаливую неудачу.
+
+    Приложение собирается как оконное (console=False), поэтому
+    необработанное исключение не даёт сообщения на экране: без проверки
+    отказ выглядел бы как «окно не открылось».
+    """
+    import main as app_main
+
+    def broken_init_db():
+        raise RuntimeError(
+            "Схема базы не соответствует программе:\n"
+            "  - в таблице documents нет колонки form_version_id\n"
+            "Обновление остановлено, чтобы не работать с повреждёнными данными. "
+            "Сообщите текст оператору и верните резервную копию из storage/backups."
+        )
+
+    monkeypatch.setattr(app_main, "init_db", broken_init_db)
+    # QApplication создавать второй раз нельзя: в Qt он синглтон, и
+    # повторный QApplication(sys.argv) роняет процесс с segfault.
+    monkeypatch.setattr(
+        app_main.QApplication, "__new__", lambda cls, *a, **k: qapp
+    )
+    assert app_main.main() == 1
+
+    assert len(gui_support["critical"]) == 1, "оператор не получил сообщение о сбое"
+    text = gui_support["critical"][0][2]
+    assert "form_version_id" in text, "в сообщении нет сути проблемы"
+    assert "backups" in text, "в сообщении нет подсказки, что делать"
