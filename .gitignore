@@ -1,11 +1,23 @@
 # Локальная база данных и архив файлов (НЕ должны попадать в Git)
-storage/*.db
 storage/app.db
+storage/app.db-wal
+storage/app.db-shm
+storage/*.db
+storage/*.db-wal
+storage/*.db-shm
+storage/settings.json
+storage/app.log
+storage/app.log.*
 storage/internal_archive/*
 storage/packages/*
+# ТЗ п.74, 98: BACKUP содержит БД + все физические файлы + связи + версии +
+# историю, то есть полностью персональные данные проекта. Утечка в репозиторий.
+storage/backups/*
+storage/tmp/*
 !storage/.gitkeep
 !storage/internal_archive/.gitkeep
 !storage/packages/.gitkeep
+!storage/backups/.gitkeep
 
 # Виртуальное окружение
 venv/
