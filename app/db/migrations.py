@@ -13,8 +13,9 @@ import logging
 import os
 import sqlite3
 
+from sqlalchemy import Boolean, Date, DateTime, Integer, String, Text, Time, Unicode
 from sqlalchemy.dialects import sqlite
-from sqlalchemy.schema import CreateIndex, CreateTable
+from sqlalchemy.schema import CreateColumn, CreateIndex, CreateTable
 
 from app.core import domain
 
@@ -41,15 +42,40 @@ def _ddl(element) -> str:
 
 
 def create_table(conn, table) -> None:
-    """Создать таблицу, если её ещё нет.
+    """Создать таблицу, если её нет, и дополнить недостающими колонками.
 
     Отказоустойчивость обязательна: справочники (направления, виды разделов)
-    могли прийти из прежней версии программы, и повторный CREATE TABLE
-    на них обрывал бы миграцию целиком — вместе с данными оператора.
+    могли прийти из прежней версии программы, и повторный CREATE TABLE на них
+    обрывал бы миграцию целиком — вместе с данными оператора.
+
+    Но одной идемпотентности мало: справочник может прийти в СТАРОЙ форме, то
+    есть без нужных колонок. Молча пропустить такую таблицу тоже нельзя —
+    падение случилось бы позже и в невнятном месте («no such column» уже во
+    время наполнения). Поэтому недостающие колонки добавляются на месте, с
+    сохранением уже внесённых оператором записей.
+
+    Все обязательные колонки справочников объявлены со значением по
+    умолчанию, поэтому ADD COLUMN допустим: SQLite не разрешает добавлять
+    NOT NULL без DEFAULT.
     """
-    if table_exists(conn, table.name):
+    if not table_exists(conn, table.name):
+        conn.execute(_ddl(CreateTable(table)))
         return
-    conn.execute(_ddl(CreateTable(table)))
+
+    existing = set(table_columns(conn, table.name))
+    for column in table.columns:
+        if column.name in existing or column.primary_key:
+            continue
+        # CreateColumn, а не Column.compile: одиночная колонка компилируется
+        # как "directions.sort_order", что для ALTER TABLE является синтаксисом.
+        definition = _ddl(CreateColumn(column))
+        conn.execute(
+            f"ALTER TABLE {table.name} ADD COLUMN {_with_default(definition, column)}"
+        )
+        logger.warning(
+            "миграция: в справочник %s добавлена отсутствовавшая колонка %s",
+            table.name, column.name,
+        )
 
 
 def create_indexes(conn) -> None:
@@ -83,6 +109,28 @@ def table_exists(conn, table: str) -> bool:
 
 def table_columns(conn, table: str) -> list[str]:
     return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+
+
+# Значения по умолчанию для добавления обязательной колонки в существующую
+# таблицу. SQLite требует DEFAULT при ADD COLUMN NOT NULL, а объявленные в
+# моделях умолчания заданы на стороне Python и в DDL не попадают.
+_SQLITE_FALLBACK_DEFAULTS = (
+    ((Integer, Boolean), "0"),
+    ((DateTime, Date, Time), "'1970-01-01 00:00:00'"),
+    ((String, Text, Unicode), "''"),
+)
+
+
+def _with_default(definition: str, column) -> str:
+    """Дописать DEFAULT к обязательной колонке, если его нет в DDL."""
+    if "NOT NULL" not in definition.upper() or "DEFAULT" in definition.upper():
+        return definition
+    for types, value in _SQLITE_FALLBACK_DEFAULTS:
+        if isinstance(column.type, types):
+            marker = " NOT NULL"
+            index = definition.upper().rindex(marker)
+            return f"{definition[:index]} DEFAULT {value}{definition[index:]}"
+    return definition
 
 
 def file_type_from_name(*names: str) -> str:

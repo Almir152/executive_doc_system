@@ -832,3 +832,45 @@ def test_bootstrap_table_from_legacy_schema_does_not_break_migration(db, tmp_pat
         assert count > 0, "идемпотентный create_table стёр справочник"
     finally:
         raw.close()
+
+
+def test_bootstrap_reference_table_in_old_shape_is_completed(db):
+    """Справочник в СТАРОЙ форме: недостающие колонки добавляются, данные целы.
+
+    Дефект (найден при повторной проверке): первая правка create_table()
+    просто пропускала существующую таблицу. Если справочник приходил из
+    прежней версии без нужных колонок, падение уезжало из миграции в
+    наполнение справочников и выглядело как 'no such column' уже после того,
+    как перенос данных считался завершённым.
+    """
+    import sqlite3 as sq
+    from app.config import DB_PATH
+    from app.db import migrations
+    from app.db.database import engine
+
+    # Пересоздаём directions вручную в старой форме: без sort_order,
+    # с записью, внесённой оператором.
+    engine.dispose()
+    conn = sq.connect(str(DB_PATH))
+    try:
+        conn.execute("DROP TABLE directions")
+        conn.execute("CREATE TABLE directions(id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO directions(name) VALUES ('Код оператора 777')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    raw = engine.raw_connection()
+    try:
+        migrations.ensure_bootstrap_tables(raw)
+        raw.commit()
+    finally:
+        raw.close()
+
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(directions)")]
+        assert "sort_order" in cols, f"колонка sort_order не добавлена: {cols}"
+        kept = conn.exec_driver_sql(
+            "SELECT count(*) FROM directions WHERE name='Код оператора 777'"
+        ).scalar()
+        assert kept == 1, "запись оператора потеряна при дополнении справочника"
