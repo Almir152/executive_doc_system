@@ -1,11 +1,23 @@
-venv/
-__pycache__/
-*.pyc
+# Локальная база данных и архив файлов (НЕ должны попадать в Git)
+storage/*.db
 storage/app.db
 storage/internal_archive/*
 storage/packages/*
-storage/backups/*
+!storage/.gitkeep
+!storage/internal_archive/.gitkeep
+!storage/packages/.gitkeep
+
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Кэш Python и PyTest
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Папки сборки PyInstaller
 build/
 dist/
 *.spec
-.pytest_cache/
