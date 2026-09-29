@@ -22,7 +22,7 @@ from app.core import domain
 logger = logging.getLogger(__name__)
 
 # Текущая версия схемы. Увеличивать при добавлении миграции.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Справочники и формы, которые миграция создаёт сама, до переноса данных.
 # Миграция не должна зависеть от того, что create_all уже отработал.
@@ -249,6 +249,23 @@ LEGACY_DOC_TYPE_MAP = {
 }
 
 DEFAULT_LINK_ROLE = domain.LINK_ROLE_ATTACHMENT
+
+
+DOCUMENT_VERSIONS_V3_DDL = """
+CREATE TABLE document_versions__new (
+    id INTEGER NOT NULL,
+    document_id INTEGER NOT NULL,
+    version_no INTEGER NOT NULL,
+    form_version_id INTEGER,
+    payload JSON NOT NULL,
+    issued_at DATETIME,
+    is_actual BOOLEAN NOT NULL,
+    created_at DATETIME NOT NULL,
+    PRIMARY KEY (id),
+    FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE RESTRICT,
+    FOREIGN KEY(form_version_id) REFERENCES normative_forms (id) ON DELETE RESTRICT
+)
+"""
 
 
 def _begin_rebuild(conn, table: str, ddl: str) -> None:
@@ -516,6 +533,38 @@ def migration_002(conn) -> None:
     create_indexes(conn)
 
 
+def migration_003(conn) -> None:
+    """Выпущенные версии документов защищены от каскадного удаления.
+
+    Таблица пересобирается, потому что SQLite не умеет менять действие
+    внешнего ключа существующей таблицы (ТЗ п.85, 54).
+    """
+    if not table_exists(conn, "document_versions"):
+        return
+    cols = table_columns(conn, "document_versions")
+    if "document_id" not in cols:
+        return
+    # Проверять текст DDL нельзя: RESTRICT есть и у второго внешнего ключа
+    # (form_version_id), и на незащищённой таблице проверка прошла бы. Смотрим
+    # действие именно по колонке document_id.
+    for fk in conn.execute("PRAGMA foreign_key_list(document_versions)").fetchall():
+        # (id, seq, table, from, to, on_update, on_delete, match)
+        if fk[3] == "document_id" and (fk[6] or "").upper() == "RESTRICT":
+            return  # уже защищена
+
+    _begin_rebuild(conn, "document_versions", DOCUMENT_VERSIONS_V3_DDL)
+    conn.execute(
+        "INSERT INTO document_versions__new "
+        "(id, document_id, version_no, form_version_id, payload, issued_at,"
+        " is_actual, created_at) "
+        "SELECT id, document_id, version_no, form_version_id, payload, issued_at,"
+        "       is_actual, created_at FROM document_versions__old"
+    )
+    _finish_rebuild(conn, "document_versions__new", "document_versions",
+                    "document_versions__old")
+    create_indexes(conn)
+
+
 # =====================================================================
 # Реестр миграций
 # =====================================================================
@@ -523,6 +572,7 @@ def migration_002(conn) -> None:
 MIGRATIONS = [
     (1, "legacy_to_stage1", migration_001),
     (2, "add_lookup_indexes", migration_002),
+    (3, "protect_issued_document_versions", migration_003),
 ]
 
 

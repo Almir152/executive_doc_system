@@ -410,10 +410,13 @@ class Document(Base):
     project = relationship("Project", back_populates="documents")
     form_version = relationship("NormativeForm", lazy="selectin")
 
+    # cascade намеренно без delete: ORM удалил бы выпущенные версии раньше
+    # родителя, и внешний ключ RESTRICT (ТЗ п.85) не успел бы сработать.
+    # Защиту обеспечивает сама БД.
     versions = relationship(
         "DocumentVersion",
         back_populates="document",
-        cascade="all, delete-orphan",
+        cascade="save-update, merge",
         order_by="DocumentVersion.version_no",
     )
     archive_links = relationship(
@@ -456,7 +459,11 @@ class DocumentVersion(Base):
 
     id = Column(Integer, primary_key=True)
     document_id = Column(
-        Integer, ForeignKey('documents.id', ondelete="CASCADE"), nullable=False
+        # RESTRICT, а не CASCADE: выпущенная версия — историческое
+        # доказательство (ТЗ п.85, 54). При CASCADE удаление черновика стирало
+        # бы зафиксированную версию без следа, а удаление проекта каскадом
+        # стирало бы выпуски всех его документов разом.
+        Integer, ForeignKey('documents.id', ondelete="RESTRICT"), nullable=False
     )
     version_no = Column(Integer, nullable=False)
     form_version_id = Column(Integer, ForeignKey('normative_forms.id', ondelete="RESTRICT"))

@@ -201,8 +201,26 @@ def delete_archive_document(db: Session, archive_document_id: int) -> None:
     document = get_archive_document(db, archive_document_id)
     if document is None:
         raise StorageError(f"Архивный документ не найден: {archive_document_id}")
-    for version in list(document.versions):
-        stored = Path(version.stored_path)
+
+    # Один физический файл может быть общим: add_version() не создаёт новую
+    # копию, если такой файл уже лежит в архиве (ТЗ п.84), и две версии
+    # разных документов способны указывать на один путь. Удалять такой файл
+    # нельзя — иначе у другого документа версия останется в базе без файла,
+    # то есть доказательство по ТЗ п.54 будет утрачено безвозвратно.
+    paths = [Path(v.stored_path) for v in list(document.versions)]
+    still_used = set()
+    if paths:
+        for other in db.scalars(
+            select(ArchiveFileVersion.stored_path).where(
+                ArchiveFileVersion.stored_path.in_([str(p) for p in paths]),
+                ArchiveFileVersion.archive_document_id != archive_document_id,
+            )
+        ):
+            still_used.add(str(other))
+
+    for stored in paths:
+        if str(stored) in still_used:
+            continue
         if stored.is_file() and stored.parent == ARCHIVE_DIR:
             stored.unlink()
     db.delete(document)

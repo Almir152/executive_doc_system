@@ -10,12 +10,15 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 
 from app.core import domain
 from app.core.services.storage_service import (
-    add_file_to_archive, add_version, find_missing_files, find_orphan_files,
+    add_file_to_archive, add_version, delete_archive_document,
+    find_missing_files, find_orphan_files,
 )
-from app.db.migrations import SCHEMA_VERSION
+from app.db.migrations import SCHEMA_VERSION, apply_migrations
+from app.db.models import ArchiveFileVersion, Document, DocumentVersion
 
 
 # =====================================================================
@@ -272,7 +275,9 @@ CREATE TABLE document_file_links (
 """
 
 
-def _build_legacy_db(path, *, with_document=True, with_link=True):
+def _build_legacy_db(
+    path, *, with_document=True, with_link=True, with_version=False
+):
     """Создать унаследованную БД в точности как в рабочей до миграции."""
     conn = sqlite3.connect(path)
     conn.executescript(LEGACY_SCHEMA)
@@ -685,11 +690,13 @@ def test_migration_of_already_migrated_database_adds_only_new_steps(tmp_path):
     plain.close()
 
     applied = apply_migrations(own_engine)
-    assert applied == ["add_lookup_indexes"], f"неожиданный набор шагов: {applied}"
+    assert applied == ["add_lookup_indexes", "protect_issued_document_versions"], (
+        f"неожиданный набор шагов: {applied}"
+    )
 
     raw = own_engine.raw_connection()
     try:
-        assert get_user_version(raw) == 2
+        assert get_user_version(raw) == SCHEMA_VERSION
     finally:
         raw.close()
     now = {r[0] for r in sqlite3.connect(db_path).execute(
@@ -723,7 +730,7 @@ def test_migration_is_not_reapplied_to_current_database(tmp_path):
     assert apply_migrations(own_engine) == [], "актуальная миграция применена повторно"
     raw = own_engine.raw_connection()
     try:
-        assert get_user_version(raw) == 2
+        assert get_user_version(raw) == SCHEMA_VERSION
     finally:
         raw.close()
 
@@ -874,3 +881,171 @@ def test_bootstrap_reference_table_in_old_shape_is_completed(db):
             "SELECT count(*) FROM directions WHERE name='Код оператора 777'"
         ).scalar()
         assert kept == 1, "запись оператора потеряна при дополнении справочника"
+
+
+# =====================================================================
+# ЗАЩИТА ВЫПУЩЕННЫХ ВЕРСИЙ (ТЗ п.54, 85)
+# =====================================================================
+
+
+def test_shared_physical_file_survives_deletion_of_one_document(db, project, tmp_path):
+    """Общий файл не удаляется вместе с одним из документов.
+
+    add_version() не создаёт копию, если такой файл уже лежит в архиве
+    (ТЗ п.84), поэтому две версии разных документов могут указывать на один
+    путь. Удаление одного документа не должно стирать доказательство
+    у другого (ТЗ п.54, 90).
+    """
+    first = tmp_path / "Схема.pdf"
+    first.write_bytes("содержимое A".encode())
+    doc_a = add_file_to_archive(db, first, project.id)
+
+    second = tmp_path / "Схема.pdf"
+    second.write_bytes("содержимое B".encode())
+    doc_b = add_file_to_archive(db, second, project.id)
+    add_version(db, doc_a.id, second)
+
+    stored_paths = [v.stored_path for v in db.query(ArchiveFileVersion).all()]
+    assert len(set(stored_paths)) < len(stored_paths), (
+        "ожидалась общая копия файла между документами"
+    )
+
+    delete_archive_document(db, doc_b.id)
+
+    assert find_missing_files(db) == [], (
+        "после удаления одного документа файл второго остался в базе без копии"
+    )
+    db.expire_all()
+    assert len(db.query(ArchiveFileVersion).all()) == 2
+
+
+def test_issued_document_version_blocks_project_deletion(db, project):
+    """Выпущенная версия — исторический результат (ТЗ п.85), проект с ней неудалим."""
+    from app.core.services.project_service import (
+        ProjectError, can_delete_project, delete_project, project_statistics,
+    )
+    from app.config import utcnow
+
+    document = Document(project_id=project.id, doc_type="АОСР", number="12")
+    db.add(document)
+    db.commit()
+    db.add(
+        DocumentVersion(
+            document_id=document.id, version_no=1,
+            payload={"номер": "12"}, issued_at=utcnow(), is_actual=True,
+        )
+    )
+    db.commit()
+
+    allowed, stats = can_delete_project(db, project.id)
+    assert allowed is False, "проект с выпущенным документом можно удалить"
+    assert stats["issued_versions"] == 1
+    assert project_statistics(db, project.id)["issued_versions"] == 1
+
+    with pytest.raises(ProjectError, match="выпущенных версий"):
+        delete_project(db, project.id)
+
+    db.rollback()
+    assert db.query(DocumentVersion).count() == 1, (
+        "выпущенная версия исчезла при попытке удаления проекта"
+    )
+
+
+def test_database_itself_protects_issued_version_from_cascade(db, project):
+    """Защита обеспечена самой БД, а не только проверкой сервиса.
+
+    Проверка сервиса обходится прямым db.delete() — то есть любым другим
+    вызывающим кодом, включая каскад удаления проекта.
+    """
+    from app.config import utcnow
+
+    document = Document(project_id=project.id, doc_type="АОСР", number="12")
+    db.add(document)
+    db.commit()
+    issued = DocumentVersion(
+        document_id=document.id, version_no=1,
+        payload={"номер": "12"}, issued_at=utcnow(), is_actual=True,
+    )
+    db.add(issued)
+    db.commit()
+
+    db.delete(document)
+    with pytest.raises(IntegrityError):
+        db.commit()
+    db.rollback()
+
+    assert db.get(DocumentVersion, issued.id) is not None, (
+        "БД позволила каскадом стереть выпущенную версию"
+    )
+
+
+def test_migration_003_protects_issued_versions_of_legacy_v2_database(tmp_path):
+    """Миграция переводит настоящую v2-таблицу на RESTRICT, не теряя выпуски.
+
+    Проверяется не «сработала ли миграция», а три свойства результата:
+    версия схемы, действие внешнего ключа и сохранность выпуска.
+    """
+    own_engine, applied, db_path = _migrate(tmp_path, "v2.db", with_version=True)
+
+    # Возвращаем таблицу к тому виду, какой был в v2: CASCADE вместо RESTRICT,
+    # с одной выпущенной версией. create_all в _migrate создаёт её уже с
+    # защитой, поэтому заменяем её вручную.
+    from app.db.database import Base
+
+    Base.metadata.create_all(bind=own_engine)
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.executescript(
+            """
+            CREATE TABLE document_versions__v2 (
+                id INTEGER NOT NULL, document_id INTEGER NOT NULL,
+                version_no INTEGER NOT NULL, form_version_id INTEGER,
+                payload JSON NOT NULL, issued_at DATETIME,
+                is_actual BOOLEAN NOT NULL, created_at DATETIME NOT NULL,
+                PRIMARY KEY (id),
+                FOREIGN KEY(document_id) REFERENCES documents (id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(form_version_id) REFERENCES normative_forms (id)
+                    ON DELETE RESTRICT
+            );
+            INSERT INTO document_versions__v2 SELECT * FROM document_versions;
+            DROP TABLE document_versions;
+            ALTER TABLE document_versions__v2 RENAME TO document_versions;
+            INSERT INTO document_versions (id, document_id, version_no, payload,
+                                          issued_at, is_actual, created_at)
+            VALUES (1, 1, 1, '{"номер": "15"}',
+                    '2026-09-30 09:00:00.000000', 1,
+                    '2026-09-30 09:00:00.000000');
+            PRAGMA user_version = 2;
+            """
+        )
+        raw.commit()
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert [
+            row[6] for row in raw.execute("PRAGMA foreign_key_list(document_versions)")
+            if row[3] == "document_id"
+        ] == ["CASCADE"], "тест не воспроизводит незащищённую схему v2"
+    finally:
+        raw.close()
+
+    assert apply_migrations(own_engine) == ["protect_issued_document_versions"]
+
+    raw = sqlite3.connect(db_path)
+    try:
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        actions = {
+            row[3]: row[6]
+            for row in raw.execute("PRAGMA foreign_key_list(document_versions)")
+        }
+        assert actions["document_id"] == "RESTRICT"
+        assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
+        kept = raw.execute(
+            "SELECT payload, issued_at FROM document_versions WHERE id = 1"
+        ).fetchone()
+        assert kept is not None, "выпущенная версия потеряна при миграции"
+        assert kept[0] == '{"номер": "15"}'
+        assert kept[1] is not None, "дата выпуска потеряна при миграции"
+    finally:
+        raw.close()
+
+    assert apply_migrations(own_engine) == [], "миграция 003 не идемпотентна"
