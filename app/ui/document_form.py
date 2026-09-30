@@ -6,6 +6,7 @@
 
 from PyQt6.QtWidgets import (
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QRadioButton,
     QPlainTextEdit, QPushButton, QScrollArea, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -67,19 +68,12 @@ class ExploitationChoiceWidget(QGroupBox):
             "выберите, как выводить поле. Решение относится к этому документу."
         ))
 
-        self.keep_box = QGroupBox()
-        self.keep_box.setCheckable(True)
-        keep_layout = QVBoxLayout(self.keep_box)
-        keep_layout.addWidget(QLabel(
+        self.keep_radio = QRadioButton(
             "Оставить пустую строку для ручного заполнения при печати"
-        ))
-        layout.addWidget(self.keep_box)
-
-        self.omit_box = QGroupBox()
-        self.omit_box.setCheckable(True)
-        omit_layout = QVBoxLayout(self.omit_box)
-        omit_layout.addWidget(QLabel("Убрать незаполненный блок из печатной формы"))
-        layout.addWidget(self.omit_box)
+        )
+        self.omit_radio = QRadioButton("Убрать незаполненный блок из печатной формы")
+        layout.addWidget(self.keep_radio)
+        layout.addWidget(self.omit_radio)
 
         self.error_label = QLabel()
         self.error_label.setWordWrap(True)
@@ -92,25 +86,14 @@ class ExploitationChoiceWidget(QGroupBox):
 
         document = self.db.get(Document, self.document_id)
         choice = getattr(document, "exploitation_missing_choice", None)
-        self.keep_box.setChecked(choice == form_service.MISSING_KEEP_PLACE)
-        self.omit_box.setChecked(choice == form_service.MISSING_OMIT_BLOCK)
-        if choice is None:
-            self.keep_box.setChecked(True)
+        self.omit_radio.setChecked(choice == form_service.MISSING_OMIT_BLOCK)
+        self.keep_radio.setChecked(choice != form_service.MISSING_OMIT_BLOCK)
 
-    def save(self) -> list[str]:
-        choice = (
-            form_service.MISSING_OMIT_BLOCK if self.omit_box.isChecked()
+    def choice(self) -> str:
+        return (
+            form_service.MISSING_OMIT_BLOCK if self.omit_radio.isChecked()
             else form_service.MISSING_KEEP_PLACE
         )
-        try:
-            form_service.set_exploitation_missing_choice(
-                self.db, self.document_id, choice
-            )
-        except form_service.FormError as exc:
-            self.error_label.setText(str(exc))
-            return [str(exc)]
-        self.error_label.setText("")
-        return []
 
 
 class DocumentFormPanel(QWidget):
@@ -199,7 +182,7 @@ class DocumentFormPanel(QWidget):
             if item.widget() is not None:
                 item.widget().deleteLater()
         self.field_edits: dict[str, QWidget] = {}
-        for section, field in _iter_fields(self.db, document):
+        for section, field in form_service._iter_fields(self.db, document):
             edit = _build_editor(field, payload.get(field["key"]))
             self.field_edits[field["key"]] = edit
             marker = " *" if field.get("required") else ""
@@ -208,6 +191,11 @@ class DocumentFormPanel(QWidget):
             )
 
         self.exploitation.reload()
+        # Решение по п.64 предлагают только там, где форма это допускает:
+        # в обычном АОСР представителя эксплуатации нет вовсе (ТЗ п.40).
+        self.exploitation.setVisible(
+            form_service.form_allows_exploitation_omission(self.db, self.document_id)
+        )
         self.dirty_label.setText("")
 
     # -----------------------------------------------------------------
@@ -231,8 +219,11 @@ class DocumentFormPanel(QWidget):
         return result
 
     def save(self, validate: bool = False) -> bool:
-        """Сохранить черновик и подписантов (ТЗ п.66)."""
-        problems = []
+        """Сохранить черновик, подписантов и решение по п.64.
+
+        Перед сохранением незаполненного представителя эксплуатации
+        предлагается выбрать, как выводить поле (ТЗ п.64).
+        """
         if validate:
             found = form_service.check_payload(self.db, self.document_id, self.payload())
             if found:
@@ -242,31 +233,63 @@ class DocumentFormPanel(QWidget):
                     "Незаполненные поля перечислены внизу (ТЗ п.96).",
                 )
                 return False
+
+        decision = self._ask_exploitation_decision()
+        if decision is False:
+            return False
+
+        choice = decision
+        if choice is None and self.exploitation.isVisible():
+            # Оператор может переменить ранее принятое решение.
+            choice = self.exploitation.choice()
+
         try:
             form_service.save_draft(
-                self.db, self.document_id, self.payload(), validate=False
+                self.db, self.document_id, self.payload(),
+                validate=False, exploitation_choice=choice,
             )
         except form_service.FormError as exc:
             QMessageBox.warning(self, "Форма не сохранена", str(exc))
             return False
-        problems += self.signatures.save()
-        problems += self.exploitation.save()
+
+        problems = self.signatures.save()
         if problems:
             self.problems.setPlainText("\n".join(f"• {p}" for p in problems))
             return False
+        self.exploitation.reload()
         self.problems.setPlainText("")
         self.dirty_label.setText("сохранено")
         return True
 
+    def _ask_exploitation_decision(self) -> str | bool | None:
+        """Спросить о выводе незаполненного поля или отменить сохранение.
 
-def _iter_fields(db, document):
-    """Поля формы документа вместе с разделом, к которому они относятся."""
-    definition = form_service.current_definition(db, document) or {}
-    for section in definition.get("sections", []):
-        blocks = list(section.get("blocks") or []) + list(section.get("fields") or [])
-        for block in blocks:
-            if block.get("key"):
-                yield section, block
+        None — спрашивать не нужно, False — оператор отказался сохранять.
+        """
+        if not form_service.needs_exploitation_decision(
+            self.db, self.document_id, self.payload()
+        ):
+            return None
+        answer = QMessageBox(self)
+        answer.setWindowTitle("Представитель эксплуатации (ТЗ п.64)")
+        answer.setText(
+            "Представитель эксплуатирующей организации не заполнен.\n"
+            "Как вывести поле при печати?"
+        )
+        keep = answer.addButton(
+            "Оставить пустую строку", QMessageBox.ButtonRole.AcceptRole
+        )
+        omit = answer.addButton(
+            "Убрать незаполненный блок", QMessageBox.ButtonRole.AcceptRole
+        )
+        answer.addButton(QMessageBox.StandardButton.Cancel)
+        answer.exec()
+        clicked = answer.clickedButton()
+        if clicked is keep:
+            return form_service.MISSING_KEEP_PLACE
+        if clicked is omit:
+            return form_service.MISSING_OMIT_BLOCK
+        return False
 
 
 def _build_editor(field: dict, value):

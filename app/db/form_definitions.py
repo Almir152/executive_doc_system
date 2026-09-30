@@ -34,6 +34,13 @@ from app.core.forms import (
 
 FORM_VERSION = 1
 
+# АОУСИТО и акты испытаний: версия 2. В версии 1 не было указания, что
+# незаполненный блок представителя эксплуатации можно убрать из печати, —
+# без этого ТЗ п.64 («если это допускается конкретной формой») выполнять
+# было нечего. В АОСР и АООК такой возможности нет: роль там не
+# предусмотрена (ТЗ п.40). Структура изменена, значит версия новая (п.96).
+FORM_VERSION_OMITTABLE_REP = 2
+
 # Роли представителей, ТЗ п.17-19 и 40.
 ROLE_CUSTOMER = "customer"
 ROLE_CONTRACTOR = "contractor"
@@ -347,7 +354,7 @@ _AOOK: dict = {
 _AOU_SITO: dict = {
     "schema": DEFINITION_SCHEMA,
     "doc_type": domain.DOC_TYPE_AOU_SITO,
-    "version": FORM_VERSION,
+    "version": FORM_VERSION_OMITTABLE_REP,
     "title": "Акт освидетельствования и приёмки устранения скрытых дефектов "
              "нарушений, выявленных при приёмке ответственных конструкций",
     "basis": "приказ Минстроя России № 344/пр (ТЗ п.34)",
@@ -423,7 +430,9 @@ _AOU_SITO: dict = {
                  "label": "Представитель эксплуатирующей организации",
                  "source": SOURCE_MANUAL, "required": False,
                  "label_fill": True, "label_sign": True,
-                 "note": "роль предусмотрена для АОУСИТО (ТЗ п.34, 40)"},
+                 "omittable_if_empty": True,
+                 "note": "роль предусмотрена для АОУСИТО (ТЗ п.34, 40); "
+                         "незаполненный блок можно убрать из печати (ТЗ п.64)"},
                 {"key": "customer_rep", "label": "Представитель заказчика",
                  "source": SOURCE_REPRESENTATIVE, "role": ROLE_CUSTOMER,
                  "label_fill": True, "label_sign": True},
@@ -438,7 +447,7 @@ _AOU_SITO: dict = {
 _TEST_ACT: dict = {
     "schema": DEFINITION_SCHEMA,
     "doc_type": domain.DOC_TYPE_TEST_ACT,
-    "version": FORM_VERSION,
+    "version": FORM_VERSION_OMITTABLE_REP,
     "title": "Акт испытания инженерной системы",
     "basis": "СП 73.13330.2016 (ТЗ п.41)",
     "layout": {
@@ -534,7 +543,9 @@ _TEST_ACT: dict = {
                  "label": "Представитель эксплуатирующей организации",
                  "source": SOURCE_MANUAL, "required": False,
                  "label_fill": True, "label_sign": True,
-                 "note": "роль предусмотрена в актах испытаний (ТЗ п.40)"},
+                 "omittable_if_empty": True,
+                 "note": "роль предусмотрена в актах испытаний (ТЗ п.40); "
+                         "незаполненный блок можно убрать из печати (ТЗ п.64)"},
             ],
         },
     ],

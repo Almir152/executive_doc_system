@@ -169,6 +169,9 @@ class FormField:
     label_fill: bool = False       # печатается ли подпись «ФИО»
     label_sign: bool = False       # печатается ли строка подписи
     ordered_choices: tuple[str, ...] = ()
+    # ТЗ п.64: незаполненный блок представителя эксплуатации можно убрать
+    # из печатной формы, если это допускает конкретная форма (п.40).
+    omittable_if_empty: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> "FormField":
@@ -379,6 +382,8 @@ def _field_to_dict(field_def: "FormField") -> dict:
         data["label_sign"] = True
     if field_def.ordered_choices:
         data["choices"] = list(field_def.ordered_choices)
+    if field_def.omittable_if_empty:
+        data["omittable_if_empty"] = True
     return data
 
 

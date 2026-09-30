@@ -354,13 +354,18 @@ def test_empty_fixed_text_is_rejected():
 
 
 def test_forms_are_loaded_into_directory(db):
-    """Формы появляются в справочнике и читаются из него."""
+    """Формы появляются в справочнике и читаются из него.
+
+    Номер версии сверяется с объявленным в определении, а не с единицей:
+    структура форм меняется (ТЗ п.96), и тест не должен ломаться на этом.
+    """
     load_form_definitions(db)
+    declared = {doc_type: raw["version"] for doc_type, raw in RAW.items()}
     for doc_type in domain.NUMBERED_DOC_TYPES:
         form = current_form(db, doc_type)
         assert form is not None, f"нет формы для {doc_type}"
         assert form.is_current
-        assert form.version == 1
+        assert form.version == declared[doc_type]
         assert parse_form(form).doc_type == doc_type
 
 

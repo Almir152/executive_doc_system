@@ -12,6 +12,11 @@ import tempfile
 
 _TEST_DATA_DIR = tempfile.mkdtemp(prefix="executive_doc_test_")
 os.environ["EXECUTIVE_DOC_DATA_DIR"] = _TEST_DATA_DIR
+# Qt запускается без дисплея: без этого GUI-тесты падают не тестом, а
+# целиком (Qt не может открыть настоящий экран и вызывает qFatal).
+# QApplication из pytest-qt создаётся на уровне сессии, раньше фикстур,
+# поэтому переменная выставляется здесь, при импорте.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 
@@ -84,10 +89,16 @@ def project(db, direction):
     return p
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def qapp_env():
-    """Гарантирует headless-окружение Qt для GUI-тестов."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    """Заглушка на случай, если фикстуру попросят явно.
+
+    Основная установка переменной — на уровне модуля: QApplication из
+    pytest-qt имеет область сессии и создаётся раньше любой фикстуры
+    области функции, поэтому переменная из фикстуры приходит слишком
+    поздно, и Qt валит процесс целиком.
+    """
+    return None
 
 
 @pytest.fixture(autouse=True)

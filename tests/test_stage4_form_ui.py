@@ -128,24 +128,125 @@ def test_signature_blocks_widget_shows_saved_values(qapp, db, document):
     assert widget.edits[form_service.BLOCK_HANDED_OVER]["position"].text() == "ГИП"
 
 
-def test_exploitation_widget_reflects_saved_choice(qapp, db, document):
+def test_exploitation_widget_reflects_saved_choice(qapp, db, project):
     """Виджет показывает сохранённое решение по документу (ТЗ п.64)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
     form_service.set_exploitation_missing_choice(
         db, document.id, form_service.MISSING_OMIT_BLOCK
     )
     widget = ExploitationChoiceWidget(db, document.id)
-    assert widget.omit_box.isChecked()
-    assert not widget.keep_box.isChecked()
+    assert widget.omit_radio.isChecked()
+    assert not widget.keep_radio.isChecked()
 
 
-def test_exploitation_widget_saves_choice(qapp, db, document):
-    widget = ExploitationChoiceWidget(db, document.id)
-    widget.omit_box.setChecked(True)
-    widget.keep_box.setChecked(False)
+def test_exploitation_widget_is_hidden_in_plain_aosr(qapp, db, project):
+    """В обычном АОСР представителя эксплуатации нет (ТЗ п.40)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR
+    )
+    panel = DocumentFormPanel(db, document.id)
+    # Место в форме есть (Этап 2), но выбирать способ вывода нельзя (ТЗ п.40).
+    assert "exploitation_rep" in panel.field_edits
+    assert not panel.exploitation.isVisibleTo(panel)
 
-    assert widget.save() == []
+
+def _patch_dialog_choice(monkeypatch, choose):
+    """Подменить ответ диалога п.64, сохранив его собственную логику.
+
+    Подменяется только нажатие кнопки, а решение «спрашивать ли вообще»
+    остаётся настоящим — иначе проверка п.64 ничего не проверяла бы.
+    """
+    holder = {"calls": 0, "button": None}
+
+    def fake_exec(dialog):
+        holder["calls"] += 1
+        holder["button"] = _dialog_button(dialog, choose)
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    monkeypatch.setattr(
+        QMessageBox, "clickedButton", lambda dialog: holder["button"]
+    )
+    return holder
+
+
+def _dialog_button(dialog, choose):
+    if isinstance(choose, QMessageBox.StandardButton):
+        return dialog.button(choose)
+    for button in dialog.buttons():
+        if choose in button.text():
+            return button
+    return None
+
+
+def test_form_asks_before_saving_omitted_block(qapp, db, project, monkeypatch):
+    """Перед сохранением предлагается выбор по п.64, и он сохраняется."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    panel = DocumentFormPanel(db, document.id)
+    asked = _patch_dialog_choice(monkeypatch, "Убрать незаполненный блок")
+
+    assert panel.save() is True
+    assert asked["calls"] == 1
     db.expire_all()
     assert document.exploitation_missing_choice == form_service.MISSING_OMIT_BLOCK
+
+
+def test_form_does_not_ask_in_plain_aosr(qapp, db, project, monkeypatch):
+    """В обычном АОСР спрашивать не о чем (ТЗ п.40)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR
+    )
+    panel = DocumentFormPanel(db, document.id)
+    asked = _patch_dialog_choice(monkeypatch, "Убрать незаполненный блок")
+
+    assert panel.save() is True
+    assert asked["calls"] == 0
+    db.expire_all()
+    assert document.exploitation_missing_choice is None
+
+
+def test_form_asks_once(qapp, db, project, monkeypatch):
+    """После решения повторный вопрос при сохранении не задаётся (ТЗ п.64)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    panel = DocumentFormPanel(db, document.id)
+    asked = _patch_dialog_choice(monkeypatch, "Оставить пустую строку")
+    panel.save()
+    panel.save()
+
+    assert asked["calls"] == 1
+
+
+def test_filled_block_needs_no_question(qapp, db, project, monkeypatch):
+    """Заполненный представитель не вызывает вопроса (ТЗ п.64)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    panel = DocumentFormPanel(db, document.id)
+    panel.field_edits["exploitation_rep"].setText("ООО «Эксплуатация»")
+    asked = _patch_dialog_choice(monkeypatch, "Убрать незаполненный блок")
+
+    assert panel.save() is True
+    assert asked["calls"] == 0
+
+
+def test_cancelling_decision_keeps_form_unsaved(
+    qapp, db, project, monkeypatch
+):
+    """Отказ от решения отменяет сохранение (ТЗ п.64)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    panel = DocumentFormPanel(db, document.id)
+    panel.field_edits["object_name"].setText("Объект")
+    _patch_dialog_choice(monkeypatch, QMessageBox.StandardButton.Cancel)
+
+    assert panel.save() is False
+    assert form_service.load_draft(db, document.id) == {}
 
 
 # =====================================================================

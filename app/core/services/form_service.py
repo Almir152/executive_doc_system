@@ -23,6 +23,9 @@ MISSING_KEEP_PLACE = "keep_place"
 MISSING_OMIT_BLOCK = "omit_block"
 MISSING_CHOICES = (MISSING_KEEP_PLACE, MISSING_OMIT_BLOCK)
 
+# Поле представителя эксплуатирующей организации (ТЗ п.40, 64).
+EXPLOITATION_FIELD = "exploitation_rep"
+
 
 class FormError(Exception):
     """Ошибка работы с формой с текстом для оператора."""
@@ -191,18 +194,78 @@ def _is_empty(value) -> bool:
     return False
 
 
+def form_has_exploitation_block(db: Session, document_id: int) -> bool:
+    """Есть ли в форме представитель эксплуатирующей организации (ТЗ п.40)."""
+    return _exploitation_capability(db, document_id)["present"]
+
+
+def form_allows_exploitation_omission(db: Session, document_id: int) -> bool:
+    """Разрешено ли убрать незаполненный блок из печатной формы (ТЗ п.64).
+
+    Разрешение задаёт форма: убрать блок можно не везде.
+    """
+    return _exploitation_capability(db, document_id)["omittable"]
+
+
+def _exploitation_capability(db: Session, document_id: int) -> dict:
+    document = db.get(Document, document_id)
+    if document is None:
+        raise FormError(f"Документ не найден: {document_id}")
+    for _, field in _iter_fields(db, document):
+        if field["key"] == EXPLOITATION_FIELD:
+            return {
+                "present": True,
+                "omittable": bool(field.get("omittable_if_empty")),
+            }
+    # Поля представителя в форме нет: выводить нечего (ТЗ п.40).
+    return {"present": False, "omittable": False}
+
+
+def needs_exploitation_decision(db: Session, document_id: int, payload: dict) -> bool:
+    """Нужно ли спросить оператора о выводе поля перед сохранением (ТЗ п.64).
+
+    Спрашивают один раз: если решение уже принято для этого документа,
+    повторный вопрос при каждом сохранении неуместен.
+    """
+    document = db.get(Document, document_id)
+    if document is None:
+        raise FormError(f"Документ не найден: {document_id}")
+    if document.exploitation_missing_choice is not None:
+        return False
+    if not form_allows_exploitation_omission(db, document_id):
+        return False
+    return _is_empty((payload or {}).get(EXPLOITATION_FIELD))
+
+
+
+def _iter_fields(db: Session, document: Document):
+    """Поля формы документа вместе с разделом, к которому они относятся."""
+    definition = current_definition(db, document) or {}
+    for section in definition.get("sections", []):
+        blocks = list(section.get("blocks") or []) + list(section.get("fields") or [])
+        for block in blocks:
+            if block.get("key"):
+                yield section, block
+
+
 def save_draft(
     db: Session,
     document_id: int,
     payload: dict,
     *,
     validate: bool = False,
+    exploitation_choice: str | None = None,
 ) -> DocumentVersion:
     """Сохранить незавершённую форму (ТЗ п.66).
 
     Черновик по определению заполнен частично, поэтому по умолчанию
     обязательные поля не проверяются. Явно запрошенная проверка выполняется
     всегда — по ней оператор узнаёт, что ещё нужно доделать.
+
+    Решение по незаполненному представителю эксплуатации (ТЗ п.64)
+    передаётся сюда же и сохраняется в одной транзакции с черновиком:
+    форма не может сохраниться, если оператор не определил, как выводить
+    этот блок.
     """
     document = db.get(Document, document_id)
     if document is None:
@@ -211,6 +274,20 @@ def save_draft(
         raise FormError(
             "Документ выпущен: его версия зафиксирована и не изменяется "
             "(ТЗ п.54, 85). Создайте новый документ для новой редакции."
+        )
+
+    if exploitation_choice is not None and exploitation_choice not in MISSING_CHOICES:
+        raise FormError(
+            "Решение по представителю эксплуатации должно быть одним из двух: "
+            "оставить место для ручного заполнения или убрать блок из печати "
+            "(ТЗ п.64)."
+        )
+    if exploitation_choice is None and needs_exploitation_decision(
+        db, document_id, payload
+    ):
+        raise FormError(
+            "Не принято решение, как выводить незаполненный блок представителя "
+            "эксплуатации (ТЗ п.64): оставить пустую строку или убрать блок."
         )
 
     if validate:
@@ -231,6 +308,8 @@ def save_draft(
     version.is_actual = True
     if document.form_version_id is not None:
         version.form_version_id = document.form_version_id
+    if exploitation_choice is not None:
+        document.exploitation_missing_choice = exploitation_choice
 
     try:
         db.commit()

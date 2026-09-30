@@ -247,6 +247,111 @@ def test_exploitation_choice_of_unknown_document_is_rejected(db):
         form_service.set_exploitation_missing_choice(db, 999999, "keep_place")
 
 
+# ---- п.40 и п.64: решение есть не в каждой форме ------------------------
+
+
+def test_plain_aosr_has_no_exploitation_decision(qapp, db, project):
+    """В обычный АОСР представитель эксплуатации не добавляется (ТЗ п.40)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR
+    )
+    assert form_service.form_allows_exploitation_omission(db, document.id) is False
+    assert form_service.needs_exploitation_decision(db, document.id, {}) is False
+
+
+def test_aook_has_no_exploitation_decision(db, project):
+    """В АООК такого представителя нет вовсе."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOOK
+    )
+    assert form_service.form_allows_exploitation_omission(db, document.id) is False
+
+
+def test_aou_sito_allows_omitting_block(db, project):
+    """В АОУСИТО роль предусмотрена, и блок можно убрать (ТЗ п.40, 64)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    assert form_service.form_allows_exploitation_omission(db, document.id) is True
+
+
+def test_saving_without_decision_is_refused(db, project):
+    """Форма не сохраняется, пока оператор не определил вывод блока (ТЗ п.64)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    with pytest.raises(form_service.FormError, match="Не принято решение"):
+        form_service.save_draft(db, document.id, {"object_name": "Объект"})
+
+    assert form_service.load_draft(db, document.id) == {}
+
+
+def test_decision_is_saved_with_the_draft(db, project):
+    """Черновик и решение сохраняются вместе, одной транзакцией (ТЗ п.64)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    form_service.save_draft(
+        db, document.id, {"object_name": "Объект"},
+        exploitation_choice=form_service.MISSING_OMIT_BLOCK,
+    )
+
+    db.expire_all()
+    assert form_service.load_draft(db, document.id)["object_name"] == "Объект"
+    assert document.exploitation_missing_choice == form_service.MISSING_OMIT_BLOCK
+
+
+def test_filled_block_needs_no_decision(db, project):
+    """Заполненный представитель снимает вопрос (ТЗ п.64)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    form_service.save_draft(db, document.id, {"exploitation_rep": "ООО «Эксплуатация»"})
+
+    assert form_service.needs_exploitation_decision(
+        db, document.id, {"exploitation_rep": "ООО «Эксплуатация»"}
+    ) is False
+
+
+def test_unknown_decision_is_refused(db, project):
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    with pytest.raises(form_service.FormError, match="ТЗ п.64"):
+        form_service.save_draft(db, document.id, {}, exploitation_choice="скрыть")
+
+
+def test_decision_rule_follows_pinned_form(db, project):
+    """Возможность убрать блок задаётся той формой, по которой заполняют (п.96).
+
+    Форма без признака `omittable_if_empty` вопроса не задаёт, даже если у
+    вида документа такая возможность есть в актуальной версии.
+    """
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    form = db.query(NormativeForm).filter(
+        NormativeForm.doc_type == domain.DOC_TYPE_AOU_SITO,
+        NormativeForm.is_current.is_(True),
+    ).one()
+    older = {**form.definition}
+    older["sections"] = [
+        {
+            **section,
+            "blocks": [
+                {k: v for k, v in block.items() if k != "omittable_if_empty"}
+                for block in section.get("blocks", [])
+            ],
+        }
+        for section in form.definition["sections"]
+    ]
+    form.definition = older
+    db.commit()
+
+    assert form_service.form_allows_exploitation_omission(db, document.id) is False
+    form_service.save_draft(db, document.id, {"object_name": "Объект"})
+
+
 # =====================================================================
 # СВЯЗЬ С ДОКУМЕНТОМ
 # =====================================================================
