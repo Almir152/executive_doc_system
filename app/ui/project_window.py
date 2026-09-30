@@ -1163,32 +1163,20 @@ class ProjectWindow(QWidget):
         if not number_changed and not date_changed:
             return
 
-        if number_changed:
-            issued = any(v.issued_at is not None for v in document.versions)
-            if issued:
-                QMessageBox.warning(
-                    self, "Номер не меняется",
-                    "Номер выпущенного документа менять нельзя: он уже использован "
-                    "в комплекте (ТЗ п.85).",
-                )
-                return
-            document_service.validate_document_number(
-                self.db, self.project_id, document.doc_type, values["number"]
-            )
-            document.number = values["number"]
-        document.doc_date = values["doc_date"]
-
-        service.record_event(
-            self.db, self.project_id, "document_updated",
-            f"Изменены реквизиты документа "
-            f"{domain.DOC_TYPE_LABELS[document.doc_type]} № {document.number}",
-            entity_type="document", entity_id=document.id,
-        )
         try:
-            self.db.commit()
-        except Exception as exc:  # noqa: BLE001 — причина показывается оператору
-            self.db.rollback()
-            QMessageBox.warning(self, "Не сохранено", f"Не удалось сохранить: {exc}")
+            # Правку и запись в историю выполняет сервис (ТЗ п.86).
+            document_service.update_document_card(
+                self.db, document,
+                number=values["number"] if number_changed else None,
+                doc_date=values["doc_date"],
+                project_id=self.project_id,
+            )
+        except document_service.DocumentNumberError as exc:
+            QMessageBox.warning(
+                self, "Не сохранено",
+                str(exc) if "выпущенного" in str(exc)
+                else f"Не удалось сохранить: {exc}",
+            )
             return
         self.reload()
 
@@ -1240,7 +1228,9 @@ class ProjectWindow(QWidget):
         if not target:
             return
         try:
-            path = printing.render_document_pdf(self.db, document, target)
+            path = printing.render_document_pdf(
+                self.db, document, target, record_history=True
+            )
         except (printing.PrintError, domain.UnknownLinkRole) as exc:
             QMessageBox.warning(self, "Форма не напечатана", str(exc))
             return

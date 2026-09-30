@@ -700,12 +700,47 @@ def render_documents_pdf(
 
 
 def render_document_pdf(
-    db: Session, document: Document, output_path: Path | str, *, page_numbers: bool = False
+    db: Session,
+    document: Document,
+    output_path: Path | str,
+    *,
+    page_numbers: bool = False,
+    record_history: bool = False,
 ) -> Path:
-    """PDF одного документа."""
-    return render_documents_pdf(
+    """PDF одного документа.
+
+    ``record_history`` пишет в историю проекта событие о сохранённом PDF
+    (ТЗ п.86). Сборка комплекта его не выставляет: там историю пишет сам
+    комплект вместе с реестром, иначе в истории было бы по событию на
+    каждый документ.
+    """
+    path = render_documents_pdf(
         db, [document], output_path, page_numbers=page_numbers
     )
+    if record_history:
+        _record_pdf_saved(db, document, path)
+    return path
+
+
+def _record_pdf_saved(db: Session, document: Document, path: Path) -> None:
+    """Отметить в истории сохранённый PDF документа (ТЗ п.86)."""
+    from app.core import domain
+    from app.core.services.project_service import record_event
+
+    issued = any(version.issued_at is not None for version in document.versions)
+    kind = "исторический PDF" if issued else "PDF черновика"
+    record_event(
+        db, document.project_id, domain.HISTORY_PDF_SAVED,
+        f"Сохранён {kind} {document.type_label} № {document.number}: "
+        f"{Path(path).name} (ТЗ п.86)",
+        entity_type="document", entity_id=document.id,
+        payload={
+            "path": str(path),
+            "file_name": Path(path).name,
+            "issued": issued,
+        },
+    )
+    db.commit()
 
 
 def page_count(pdf_path: Path | str) -> int:

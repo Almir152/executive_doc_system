@@ -151,6 +151,56 @@ def create_document(
     return document
 
 
+def update_document_card(
+    db: Session,
+    document: Document,
+    *,
+    number: str | None = None,
+    doc_date: date | None = None,
+    project_id: int | None = None,
+) -> Document:
+    """Изменить номер и дату документа (ТЗ п.42, 43, 85, 86).
+
+    Номер выпущенного документа менять нельзя: он уже использован в
+    комплекте (ТЗ п.85). Событие истории пишется здесь же, в той же
+    транзакции, что и правка, — иначе правка из любого другого входа
+    осталась бы в истории незаметной (ТЗ п.86).
+    """
+    project_id = project_id if project_id is not None else document.project_id
+    if number is not None and number != document.number:
+        if any(version.issued_at is not None for version in document.versions):
+            raise DocumentNumberError(
+                "Номер выпущенного документа менять нельзя: он уже использован "
+                "в комплекте (ТЗ п.85)."
+            )
+        document.number = validate_document_number(
+            db, project_id, document.doc_type, number
+        )
+    document.doc_date = validate_document_date(doc_date)
+    try:
+        db.flush()
+        record_event(
+            db, project_id, domain.HISTORY_DOCUMENT_UPDATED,
+            f"Изменены реквизиты документа "
+            f"{document.type_label} № {document.number} (ТЗ п.42, 43, 86)",
+            entity_type="document", entity_id=document.id,
+            payload={
+                "number": document.number,
+                "doc_date": (
+                    document.doc_date.isoformat() if document.doc_date else None
+                ),
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise DocumentNumberError(
+            f"Не удалось сохранить реквизиты документа № {number}: номер уже занят."
+        ) from exc
+    db.refresh(document)
+    return document
+
+
 def list_documents(db: Session, project_id: int) -> list[Document]:
     """Документы проекта: сначала вид в порядке ТЗ п.42, внутри — по номеру.
 

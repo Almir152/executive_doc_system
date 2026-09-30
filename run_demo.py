@@ -27,7 +27,7 @@ from app.config import DATA_DIR, PACKAGES_DIR, ensure_dirs  # noqa: E402
 from app.core import domain  # noqa: E402
 from app.core.services.exporter import export_package  # noqa: E402
 from app.core.services.project_service import (  # noqa: E402
-    ProjectError, can_delete_project, delete_project,
+    ProjectError, can_delete_project, delete_project, list_events,
 )
 from app.core.services.storage_service import (  # noqa: E402
     add_file_to_archive, add_version, can_delete_archive_document, delete_archive_document,
@@ -84,10 +84,15 @@ def main() -> int:
     print(f"\n[+] Проект создан: '{project.title}' (ID: {project.id})")
 
     # --- Документы (ТЗ п.42, 43) ---
-    aosr1 = Document(project_id=project.id, doc_type=domain.DOC_TYPE_AOSR, number="1")
-    aosr2 = Document(project_id=project.id, doc_type=domain.DOC_TYPE_AOSR, number="2")
-    db.add_all([aosr1, aosr2])
-    db.commit()
+    # Создание идёт через сервис: он же пишет событие истории (ТЗ п.86).
+    from app.core.services import document_service
+
+    aosr1 = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR, number="1"
+    )
+    aosr2 = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR, number="2"
+    )
     check(
         "документы в статусе 'черновик' (ТЗ п.85)",
         all(d.status == domain.DOC_STATUS_DRAFT for d in (aosr1, aosr2)),
@@ -109,12 +114,10 @@ def main() -> int:
         "conclusion": "Работы выполнены в полном объёме",
         "work_performer": "ООО «Строй»",
     })
-    aook = Document(
-        project_id=project.id, doc_type=domain.DOC_TYPE_AOOK, number="1",
+    aook = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOOK, number="1",
         doc_date=_date(2024, 5, 15),
     )
-    db.add(aook)
-    db.commit()
 
     def _aook_payload(start: str, end: str) -> dict:
         return {
@@ -254,6 +257,25 @@ def main() -> int:
         == "Комплект 02",
     )
 
+    # --- История проекта сохраняет результаты работы (ТЗ п.86) ---
+    history_types = [event.event_type for event in list_events(db, project.id)]
+    for expected, label in (
+        (domain.HISTORY_DOCUMENT_CREATED, "создание документов"),
+        (domain.HISTORY_DOCUMENT_ISSUED, "выпуск версии документа"),
+        (domain.HISTORY_LINK_ADDED, "связь акта с файлом архива"),
+        (domain.HISTORY_PACKAGE_EXPORTED, "сформированный комплект"),
+        (domain.HISTORY_REGISTER_WRITTEN, "реестр комплекта"),
+        (domain.HISTORY_ARCHIVE_FILE_ADDED, "изменение архивных документов"),
+    ):
+        check(f"история сохраняет: {label} (ТЗ п.86)", expected in history_types)
+    register_event = next(
+        event for event in list_events(db, project.id)
+        if event.event_type == domain.HISTORY_REGISTER_WRITTEN
+    )
+    check("в записи о реестре есть число строк (ТЗ п.86)",
+          register_event.payload["rows"] >= 1,
+          f"строк: {register_event.payload['rows']}")
+
     # --- Удаление проекта не должно унести архив (ТЗ п.54, 109) ---
     allowed, stats = can_delete_project(db, project.id)
     check("проект с архивом удалить нельзя (ТЗ п.109)", not allowed,
@@ -298,7 +320,6 @@ def main() -> int:
     db.close()
 
     print("\n=== НЕ РЕАЛИЗОВАНО ===")
-    print("  - история по комплектам, реестрам и историческим PDF (п.86)")
     print("  - связь акта испытаний со строкой материала (п.44-48)")
     print("  - BACKUP, восстановление и перенос (п.74, 98)")
     print("  - обновление через миграции (п.97)")

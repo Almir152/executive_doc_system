@@ -627,6 +627,27 @@ def create_package(
 
     from app.core.services.project_service import record_event
 
+    # Реестр — отдельный результат работы: по п.86 он виден в истории сам
+    # по себе, а не только внутри записи о комплекте.
+    record_event(
+        db, project_id, domain.HISTORY_REGISTER_WRITTEN,
+        f"Сформирован реестр комплекта «{name}»: строк {len(plan.entries)}, "
+        f"из них приложений "
+        f"{sum(1 for entry in plan.entries if entry.is_attachment)} (ТЗ п.75, 86)",
+        entity_type="package",
+        entity_id=package.id,
+        payload={
+            "file_name": REGISTRY_FILE_NAME,
+            "rows": len(plan.entries),
+            "documents": len(plan.documents),
+            "attachments": sum(
+                1 for entry in plan.entries if entry.is_attachment
+            ),
+            "has_combined_pdf": bool(
+                page_numbering and len(plan.documents) > 1
+            ),
+        },
+    )
     record_event(
         db, project_id, domain.HISTORY_PACKAGE_EXPORTED,
         f"Сформирован комплект «{name}»: вариант "

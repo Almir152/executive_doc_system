@@ -235,6 +235,8 @@ HISTORY_ARCHIVE_FILE_ADDED = "archive_file_added"
 HISTORY_ARCHIVE_VERSION_ADDED = "archive_version_added"
 HISTORY_ARCHIVE_QUALITY_SET = "archive_quality_set"
 HISTORY_PACKAGE_EXPORTED = "package_exported"
+HISTORY_REGISTER_WRITTEN = "register_written"
+HISTORY_PDF_SAVED = "pdf_saved"
 HISTORY_AI_PROPOSED = "ai_proposed"
 HISTORY_AI_ACTION_APPLIED = "ai_action_applied"
 
