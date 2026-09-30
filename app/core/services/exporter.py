@@ -5,11 +5,15 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from app.core.services.export_checks import CheckResult
-from app.db.models import Project, Document
+from app.core.services.export_checks import CheckResult, ERRORS_FILE_NAME
+from app.core.services.package_service import create_package
 
-# ТЗ п.83: файл ошибок относится только к текущей выгрузке.
-ERRORS_FILE_NAME = "Ошибки выгрузки.txt"
+__all__ = [
+    "ERRORS_FILE_NAME",
+    "export_package",
+    "generate_simple_pdf",
+    "write_errors_file",
+]
 
 # Регистрируем шрифт с поддержкой кириллицы
 FONT_NAME = "Helvetica"
@@ -63,27 +67,19 @@ def write_errors_file(target_dir: Path | str, result: CheckResult) -> Path:
     return path
 
 
-def export_package(db: Session, project_id: int, target_dir: Path | str) -> Path:
-    """Формирование выгрузки комплекта (Разделы 69-81 ТЗ).
+def export_package(
+    db: Session,
+    project_id: int,
+    target_dir: Path | str,
+    **options,
+) -> Path:
+    """Сформировать комплект в папке, выбранной оператором (ТЗ п.69–83).
 
     `target_dir` приходит из диалога выбора папки, то есть строкой: путь
     приводится к `Path` здесь, иначе выгрузка падала бы с
-    «'str' object has no attribute 'mkdir'».
+    «'str' object has no attribute 'mkdir'». Внутри выбранной папки
+    создаётся корневая папка комплектов, а в ней — отдельная папка
+    выгрузки (ТЗ п.70, 71).
     """
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise ValueError("Проект не найден")
-
-    target_dir = Path(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    
-    registry_lines = [f"РЕЕСТР ВЫГРУЗКИ: {project.title}", "="*50]
-    docs = db.query(Document).filter(Document.project_id == project_id).all()
-    
-    for idx, doc in enumerate(docs, start=1):
-        registry_lines.append(f"№ {idx} | Тип: {doc.doc_type} | Номер документа: {doc.number}")
-
-    registry_pdf = target_dir / "Реестр_выгрузки.pdf"
-    generate_simple_pdf(registry_pdf, "РЕЕСТР ИСПОЛНИТЕЛЬНОЙ ДОКУМЕНТАЦИИ", registry_lines)
-
-    return target_dir
+    package = create_package(db, project_id, base_dir=Path(target_dir), **options)
+    return Path(package.absolute_path)

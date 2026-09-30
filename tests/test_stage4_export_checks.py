@@ -2,12 +2,15 @@
 
 from datetime import date, timedelta
 
+from pathlib import Path
+
 import pytest
 
 from app.config import utcnow
 from app.core import domain
 from app.core.services import (
-    document_service, export_checks, exporter, form_service, storage_service,
+    document_service, export_checks, exporter, form_service, issue_service,
+    storage_service,
 )
 from app.db.models import (
     DocumentArchiveLink, DocumentVersion, ProjectSection, SectionKind,
@@ -39,6 +42,36 @@ def _issue(db, document, payload=None):
         version.issued_at = utcnow()
     document.status = domain.DOC_STATUS_ISSUED
     db.commit()
+    return document
+
+
+RELEASED_PAYLOAD = {
+    "object_name": "ЖК Северный, корпус 2",
+    "address": "г. Москва, ул. Северная, 1",
+    "work_description": "Армирование стен и перекрытий",
+    "section_refs": "КЖ",
+    "work_period": "с 01.04.2024 по 30.04.2024",
+    "work_volume": "120 м² бетона Б25",
+    "has_defects": "Нет",
+    "conclusion": "Работы выполнены в полном объёме",
+    "work_performer": "ООО «Строй»",
+}
+
+
+@pytest.fixture
+def released_with_form(db, project):
+    """Документ с заполненной формой и зафиксированной версией (ТЗ п.85)."""
+    db.add(ProjectSection(
+        project_id=project.id, kind_id=db.query(SectionKind).first().id,
+        code="КЖ", name="Конструкции",
+    ))
+    db.commit()
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR, number="15",
+        doc_date=date(2026, 3, 1),
+    )
+    form_service.save_draft(db, document.id, dict(RELEASED_PAYLOAD))
+    issue_service.issue_document(db, document.id, doc_date=date(2026, 3, 1))
     return document
 
 
@@ -276,7 +309,7 @@ def test_report_lists_every_problem(db, project, document):
     result = export_checks.check_package(db, project.id)
 
     report = result.report()
-    assert f"Обнаружено проблем: {len(result.problems)}" in report
+    assert f"Обнаружено замечаний: {len(result.problems)}" in report
     for problem in result.problems:
         assert problem.code in report
         assert problem.message in report
@@ -430,6 +463,67 @@ def target_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+def stub_package_dialog(monkeypatch, base_dir, *, document_ids=None,
+                         variant=domain.EXPORT_VARIANT_ALL,
+                         page_numbering=False, accepted=True):
+    """Диалог комплекта (ТЗ п.69) без реального окна.
+
+    Возвращает состояние, чтобы тест мог проверить решение оператора.
+    """
+    import app.ui.main_window as main_module
+    from app.ui.package_dialog import PackageDialog
+
+    state = {
+        "document_ids": document_ids,
+        "variant": variant,
+        "page_numbering": page_numbering,
+        "root_name": "Комплекты",
+        "exec_calls": 0,
+    }
+
+    class FakeDialog:
+        DialogCode = PackageDialog.DialogCode
+
+        def __init__(self, db, project_id, parent=None):
+            self.db = db
+            self.project_id = project_id
+            self.base_dir = Path(base_dir)
+
+        def exec(self):
+            state["exec_calls"] += 1
+            return (
+                PackageDialog.DialogCode.Accepted if accepted
+                else PackageDialog.DialogCode.Rejected
+            )
+
+        def selected_document_ids(self):
+            if state["document_ids"] is not None:
+                return list(state["document_ids"])
+            from app.core.services import package_service
+
+            return [
+                d.id for d in package_service.project_documents(
+                    self.db, self.project_id
+                )
+            ]
+
+        def variant(self):
+            return state["variant"]
+
+        def root_name(self):
+            return state["root_name"]
+
+        def page_numbering(self):
+            return state["page_numbering"]
+
+    monkeypatch.setattr(main_module, "PackageDialog", FakeDialog)
+    return state
+
+
+def package_folder(base_dir, name="Комплект 01"):
+    return Path(base_dir) / "Комплекты" / name
+
+
 def _problem() -> export_checks.CheckResult:
     return export_checks.CheckResult((
         export_checks.CheckProblem(
@@ -463,17 +557,19 @@ def test_operator_can_cancel_export_on_errors(main_window, dialogs):
 
 
 def test_export_creates_errors_file_after_confirmation(
-    main_window, dialogs, target_dir, monkeypatch
+    main_window, dialogs, target_dir, monkeypatch, document
 ):
     """После подтверждения выгрузка завершается и пишет файл ошибок (ТЗ п.83)."""
     monkeypatch.setattr(
         main_window, "_confirm_export_with_errors", lambda result: True
     )
+    stub_package_dialog(monkeypatch, target_dir)
 
     main_window.export_project_pdf()
 
-    assert (target_dir / "Ошибки выгрузки.txt").is_file()
-    assert (target_dir / "Реестр_выгрузки.pdf").is_file()
+    folder = package_folder(target_dir)
+    assert (folder / "Ошибки выгрузки.txt").is_file()
+    assert (folder / "Реестр_выгрузки.pdf").is_file()
     assert dialogs["messages"], "оператору сообщают о результате выгрузки"
     assert any("Ошибки выгрузки.txt" in message[0] for message in dialogs["messages"])
 
@@ -482,26 +578,32 @@ def test_export_is_not_started_when_operator_declines(
     main_window, dialogs, target_dir, monkeypatch
 ):
     """Без согласия оператора выгрузка не начинается (ТЗ п.83)."""
-    from PyQt6.QtWidgets import QFileDialog
-
-    asked = []
     monkeypatch.setattr(
         main_window, "_confirm_export_with_errors", lambda result: False
     )
-    monkeypatch.setattr(
-        QFileDialog, "getExistingDirectory",
-        staticmethod(lambda *a, **k: asked.append(True) or str(target_dir)),
-    )
+    stub_package_dialog(monkeypatch, target_dir)
 
     main_window.export_project_pdf()
 
-    assert asked == [], "без согласия оператора папка выгрузки не выбирается"
+    assert not package_folder(target_dir).exists()
     assert not (target_dir / "Реестр_выгрузки.pdf").exists()
     assert not (target_dir / "Ошибки выгрузки.txt").exists()
 
 
-def test_clean_package_exports_without_errors_file(
+def test_export_is_not_started_when_dialog_is_cancelled(
     main_window, dialogs, target_dir, monkeypatch
+):
+    """Отмена диалога комплекта ничего не выгружает (ТЗ п.69)."""
+    state = stub_package_dialog(monkeypatch, target_dir, accepted=False)
+
+    main_window.export_project_pdf()
+
+    assert state["exec_calls"] == 1
+    assert not package_folder(target_dir).exists()
+
+
+def test_clean_package_exports_without_errors_file(
+    main_window, dialogs, target_dir, monkeypatch, released_with_form
 ):
     """Чистый комплект выгружается без файла ошибок и без вопроса (ТЗ п.83)."""
     import app.ui.main_window as main_module
@@ -510,11 +612,96 @@ def test_clean_package_exports_without_errors_file(
         raise AssertionError("чистый комплект не должен спрашивать оператора")
 
     monkeypatch.setattr(
-        main_module, "check_package", lambda dbase, pid: export_checks.CheckResult(())
+        main_module, "check_package", lambda dbase, pid, ids=None: export_checks.CheckResult(())
     )
     monkeypatch.setattr(main_window, "_confirm_export_with_errors", no_dialog)
+    stub_package_dialog(monkeypatch, target_dir)
 
     main_window.export_project_pdf()
 
-    assert (target_dir / "Реестр_выгрузки.pdf").is_file()
-    assert not (target_dir / "Ошибки выгрузки.txt").exists()
+    folder = package_folder(target_dir)
+    assert (folder / "Реестр_выгрузки.pdf").is_file()
+    assert not (folder / "Ошибки выгрузки.txt").exists()
+
+
+def test_export_reports_folder_problem_instead_of_crash(
+    main_window, dialogs, tmp_path, monkeypatch, released_with_form
+):
+    """Недоступное место хранения: понятное сообщение, рабочая база цела."""
+    import app.ui.main_window as main_module
+
+    (tmp_path / "Комплекты").write_text("не папка", encoding="utf-8")
+    stub_package_dialog(monkeypatch, tmp_path)
+
+    main_window.export_project_pdf()
+
+    texts = [text for message in dialogs["messages"] for text in message]
+    assert any("заново" in text for text in texts), (
+        "оператору предлагают выбрать место хранения заново (ТЗ п.73): "
+        f"{texts}"
+    )
+    assert main_module.MainWindow is not None
+
+
+def test_warnings_do_not_block_export_but_are_shown(
+    main_window, dialogs, target_dir, monkeypatch, released_with_form
+):
+    """Замечание не останавливает выгрузку, но видно оператору (ТЗ п.83)."""
+    import app.ui.main_window as main_module
+
+    monkeypatch.setattr(
+        main_module, "check_package",
+        lambda dbase, pid, ids=None: export_checks.CheckResult((
+            export_checks.CheckProblem(
+                export_checks.CHECK_ATTACHMENTS,
+                "АОСР №1",
+                "У документа нет приложений",
+                export_checks.SEVERITY_WARNING,
+            ),
+        )),
+    )
+
+    def no_dialog(result):
+        raise AssertionError("замечание не должно требовать решения оператора")
+
+    monkeypatch.setattr(main_window, "_confirm_export_with_errors", no_dialog)
+    stub_package_dialog(monkeypatch, target_dir)
+
+    main_window.export_project_pdf()
+
+    folder = package_folder(target_dir)
+    assert (folder / "Реестр_выгрузки.pdf").is_file()
+    assert not (folder / export_checks.ERRORS_FILE_NAME).exists()
+    texts = [text for message in dialogs["messages"] for text in message]
+    assert any("У документа нет приложений" in text for text in texts), (
+        f"замечание должно быть показано оператору: {texts}"
+    )
+
+
+def test_warnings_are_capped_with_remainder(
+    main_window, dialogs, target_dir, monkeypatch, released_with_form
+):
+    """Длинный список замечаний обрезается с указанием остатка (ТЗ п.83)."""
+    import app.ui.main_window as main_module
+
+    monkeypatch.setattr(
+        main_module, "check_package",
+        lambda dbase, pid, ids=None: export_checks.CheckResult(tuple(
+            export_checks.CheckProblem(
+                export_checks.CHECK_ATTACHMENTS,
+                f"АОСР №{index}",
+                "нет приложений",
+                export_checks.SEVERITY_WARNING,
+            )
+            for index in range(1, 14)
+        )),
+    )
+    monkeypatch.setattr(main_window, "_confirm_export_with_errors", lambda result: True)
+    stub_package_dialog(monkeypatch, target_dir)
+
+    main_window.export_project_pdf()
+
+    texts = [text for message in dialogs["messages"] for text in message]
+    summary = [text for text in texts if "ещё" in text]
+    assert summary, f"оператор должен видеть, что список неполный: {texts}"
+    assert "3 замечаний" in summary[0]

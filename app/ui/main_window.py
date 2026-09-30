@@ -18,8 +18,12 @@ from app.core.services.storage_service import (
     ARCHIVE_CATEGORIES, ARCHIVE_CATEGORY_DEFAULT, StorageError, add_file_to_archive,
     calculate_hash, find_by_hash,
 )
+from app.core.services import export_checks
 from app.core.services.export_checks import check_package
-from app.core.services.exporter import export_package, write_errors_file
+from app.core.services.package_service import PackageError, create_package
+from app.core.services.printing import PrintError
+from app.core.domain import UnknownLinkRole
+from app.ui.package_dialog import PackageDialog
 from app.ui.directories_page import DirectoryPage
 from app.ui.project_window import ProjectWindow
 from app.core.services.project_service import (
@@ -570,32 +574,62 @@ class MainWindow(QMainWindow):
         )
 
     def export_project_pdf(self):
+        """Сформировать комплект: выбор документов, вариант и папка (ТЗ п.69)."""
         project_id = self.selected_project_id()
         if project_id is None:
             QMessageBox.warning(self, "Ошибка", "Выберите проект!")
             return
 
-        # ТЗ п.82: комплект проверяется до выгрузки, а не после.
-        result = check_package(self.db, project_id)
+        dialog = PackageDialog(self.db, project_id, self)
+        if dialog.exec() != PackageDialog.DialogCode.Accepted:
+            return
+        document_ids = dialog.selected_document_ids()
+
+        # ТЗ п.82: проверяются только документы этой выгрузки, до создания
+        # папки комплектов.
+        result = check_package(self.db, project_id, document_ids)
         if result.has_errors and not self._confirm_export_with_errors(result):
             return
 
-        target_dir = QFileDialog.getExistingDirectory(self, "Папка для выгрузки")
-        if not target_dir:
-            return
         try:
-            out_path = export_package(self.db, project_id, target_dir)
-            if result.has_errors:
-                errors_path = write_errors_file(out_path, result)
-                QMessageBox.information(
-                    self, "Выгружено с ошибками",
-                    f"Комплект выгружен:\n{os.path.normpath(out_path)}\n\n"
-                    f"Проблемы записаны в файл:\n{os.path.normpath(str(errors_path))}",
-                )
-                return
-            QMessageBox.information(self, "Успех", f"Пакет выгружен:\n{os.path.normpath(out_path)}")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", str(e))
+            package = create_package(
+                self.db, project_id,
+                base_dir=dialog.base_dir,
+                root_name=dialog.root_name(),
+                document_ids=document_ids,
+                variant=dialog.variant(),
+                page_numbering=dialog.page_numbering(),
+                allow_errors=result.has_errors,
+            )
+        except (PackageError, PrintError, UnknownLinkRole) as exc:
+            # ТЗ п.73: место хранения предлагается выбрать заново.
+            QMessageBox.critical(self, "Комплект не сформирован", str(exc))
+            return
+        except StorageError as exc:
+            QMessageBox.critical(self, "Ошибка файла", str(exc))
+            return
+
+        folder = os.path.normpath(package.absolute_path)
+        text = f"Комплект сформирован:\n{folder}"
+        if package.has_errors_file:
+            text += (
+                f"\n\nПроблемы записаны в файл:\n"
+                f"{os.path.normpath(str(Path(folder) / export_checks.ERRORS_FILE_NAME))}"
+            )
+        if result.warnings:
+            # Длинный список замечаний сверху: оператор видит главное сразу
+            # (ТЗ п.83), остальное — в отчёте и файле ошибок.
+            shown = result.warnings[:10]
+            lines = [f"• {problem.subject}: {problem.message}" for problem in shown]
+            rest = len(result.warnings) - len(shown)
+            if rest:
+                lines.append(f"• и ещё {rest} замечаний — см. отчёт проверки.")
+            text += "\n\nЗамечания:\n" + "\n".join(lines)
+        QMessageBox.information(
+            self,
+            "Выгружено с ошибками" if package.has_errors_file else "Успех",
+            text,
+        )
 
     def _confirm_export_with_errors(self, result) -> bool:
         """Показать проблемы комплекта и спросить, выгружать ли всё равно.

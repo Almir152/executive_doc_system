@@ -164,13 +164,29 @@ def main() -> int:
     for proposal in analysis["proposals"]:
         print(f"    Предложение ИИ: {proposal}")
 
-    # --- Выгрузка реестра ---
-    package_dir = PACKAGES_DIR / "Комплект_01"
-    export_package(db, project.id, package_dir)
-    print(f"\n[+] Реестр выгружен в: {package_dir}")
-    for f in sorted(package_dir.glob("*.pdf")):
-        print(f"    - {f.name}")
-    check("выгрузка создала PDF реестра", bool(list(package_dir.glob("*.pdf"))))
+    # --- Выгрузка комплекта ---
+    # Демонстрационные документы не выпущены: комплект выгружается с
+    # пометкой об ошибках (ТЗ п.83), как это сделал бы оператор.
+    folder = export_package(
+        db, project.id, PACKAGES_DIR, allow_errors=True
+    )
+    print(f"\n[+] Комплект выгружен в: {folder}")
+    for f in sorted(folder.rglob("*")):
+        if f.is_file():
+            print(f"    - {f.relative_to(folder)}")
+    check(
+        "выгрузка создала реестр (ТЗ п.76)",
+        (folder / "Реестр_выгрузки.pdf").is_file(),
+    )
+    check(
+        "проблемный комплект помечен файлом ошибок (ТЗ п.83)",
+        (folder / "Ошибки выгрузки.txt").is_file(),
+    )
+    check(
+        "прежняя выгрузка не изменена (ТЗ п.71)",
+        export_package(db, project.id, PACKAGES_DIR, allow_errors=True).name
+        == "Комплект 02",
+    )
 
     # --- Удаление проекта не должно унести архив (ТЗ п.54, 109) ---
     allowed, stats = can_delete_project(db, project.id)
@@ -198,11 +214,13 @@ def main() -> int:
 
     db.close()
 
-    print("\n=== НЕ РЕАЛИЗОВАНО (этапы 3-7) ===")
-    print("  - комплекты документов и печать по ТЗ (п.55-62, 68-80)")
-    print("  - выпуск документа и предэкспортные проверки (п.53-54, 82-83)")
-    print("  - BACKUP по расписанию (п.74, 98)")
-    print("  - ИИ-анализ реально проверяет документы, а не возвращает заглушку")
+    print("\n=== НЕ РЕАЛИЗОВАНО ===")
+    print("  - история по комплектам, реестрам и историческим PDF (п.86)")
+    print("  - проверки логических дат между документами (п.87)")
+    print("  - связь акта испытаний со строкой материала (п.44-48)")
+    print("  - BACKUP, восстановление и перенос (п.74, 98)")
+    print("  - обновление через миграции (п.97)")
+    print("  - ИИ: контекст по запросу, черновики и подтверждение (п.101-106)")
 
     if FAILURES:
         print(f"\n=== ПРОВЕРКА НЕ ПРОЙДЕНА: {len(FAILURES)} ===")

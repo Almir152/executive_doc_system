@@ -117,10 +117,27 @@ def test_export_creates_registry_pdf(db, project, tmp_path):
     db.add(Document(project_id=project.id, doc_type=domain.DOC_TYPE_AOSR, number="100-П"))
     db.commit()
 
-    out = export_package(db, project.id, tmp_path / "export_test")
+    out = export_package(db, project.id, tmp_path / "export_test", allow_errors=True)
     pdf = out / "Реестр_выгрузки.pdf"
     assert pdf.exists()
     assert pdf.stat().st_size > 0
+
+
+def test_export_creates_own_folder_for_package(db, project, tmp_path):
+    """Каждая выгрузка — отдельная папка внутри корневой (ТЗ п.70, 71)."""
+    from app.db.models import Document
+
+    from app.core import domain
+
+    db.add(Document(project_id=project.id, doc_type=domain.DOC_TYPE_AOSR, number="100-П"))
+    db.commit()
+
+    first = export_package(db, project.id, tmp_path, allow_errors=True)
+    second = export_package(db, project.id, tmp_path, allow_errors=True)
+
+    assert first.name == "Комплект 01"
+    assert second.name == "Комплект 02"
+    assert (first / "Реестр_выгрузки.pdf").exists()
 
 
 def test_export_missing_project_raises(db, tmp_path):

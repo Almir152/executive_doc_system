@@ -25,6 +25,9 @@ from app.db.models import (
     Project, ProjectSection,
 )
 
+# Файл ошибок выгрузки относится только к текущей выгрузке (ТЗ п.83).
+ERRORS_FILE_NAME = "Ошибки выгрузки.txt"
+
 # Категории проверок из ТЗ п.82.
 CHECK_DOCUMENTS = "documents"
 CHECK_LINKS = "links"
@@ -38,6 +41,12 @@ CHECK_COMPOSITION = "composition"
 # Роли связей, которые означают приложение к документу (ТЗ п.79, 80).
 ATTACHMENT_ROLES = (domain.LINK_ROLE_ATTACHMENT,)
 
+# Серьёзность замечания. Ошибка останавливает выгрузку: оператор должен
+# исправить данные или явно выбрать выгрузку с пометкой (ТЗ п.83).
+# Замечание показывается, но выгрузку не блокирует.
+SEVERITY_ERROR = "error"
+SEVERITY_WARNING = "warning"
+
 
 @dataclass(frozen=True)
 class CheckProblem:
@@ -46,6 +55,11 @@ class CheckProblem:
     code: str
     subject: str
     message: str
+    severity: str = SEVERITY_ERROR
+
+    @property
+    def is_error(self) -> bool:
+        return self.severity == SEVERITY_ERROR
 
     def __str__(self) -> str:
         return f"{self.subject}: {self.message}"
@@ -59,7 +73,17 @@ class CheckResult:
 
     @property
     def has_errors(self) -> bool:
+        """Есть ли ошибки, останавливающие выгрузку (ТЗ п.82)."""
+        return any(problem.is_error for problem in self.problems)
+
+    @property
+    def has_problems(self) -> bool:
+        """Есть ли замечания вовсе, включая не блокирующие (ТЗ п.82)."""
         return bool(self.problems)
+
+    @property
+    def warnings(self) -> tuple[CheckProblem, ...]:
+        return tuple(p for p in self.problems if not p.is_error)
 
     def by_code(self, code: str) -> list[CheckProblem]:
         return [problem for problem in self.problems if problem.code == code]
@@ -68,9 +92,11 @@ class CheckResult:
         """Текст отчёта для оператора (ТЗ п.82, 83)."""
         if not self.problems:
             return "Ошибок не обнаружено."
-        lines = [f"Обнаружено проблем: {len(self.problems)}", ""]
+        lines = [f"Обнаружено замечаний: {len(self.problems)}", ""]
         lines.extend(
-            f"- {problem.code}: {problem}" for problem in self.problems
+            f"- {'ошибка' if problem.is_error else 'внимание'}: "
+            f"{problem.code}: {problem}"
+            for problem in self.problems
         )
         return "\n".join(lines)
 
@@ -150,15 +176,20 @@ def _check_versions(db: Session, documents: list[Document]) -> list[CheckProblem
     )
     problems = []
     for document in documents:
-        if document.status != domain.DOC_STATUS_ISSUED:
+        if document.id not in released:
             problems.append(CheckProblem(
                 CHECK_VERSIONS, _label(document),
-                f"Документ не выпущен (статус: {document.status}).",
+                "У документа нет выпущенной версии: документ не выпущен "
+                "(ТЗ п.54, 85).",
             ))
-        elif document.id not in released:
+        elif document.status != domain.DOC_STATUS_ISSUED:
+            # Документ отредактирован после выпуска: в комплект идёт
+            # выпущенная версия (ТЗ п.91), поэтому это не ошибка.
             problems.append(CheckProblem(
                 CHECK_VERSIONS, _label(document),
-                "У документа нет выпущенной версии.",
+                "У документа новая невыпущенная редакция: в комплект попадёт "
+                "выпущенная версия (ТЗ п.91).",
+                SEVERITY_WARNING,
             ))
     return problems
 
@@ -273,9 +304,13 @@ def _check_attachments(
         )
     ))
     if not links:
+        # ТЗ п.79 задаёт правило отображения приложений, но не требует их
+        # наличия у каждого документа: запрещать выгрузку акта без
+        # приложений было бы неверно.
         return [CheckProblem(
             CHECK_ATTACHMENTS, "Комплект",
             "Ни у одного документа нет приложений (ТЗ п.79).",
+            SEVERITY_WARNING,
         )]
     problems = []
     for link in links:
@@ -283,6 +318,7 @@ def _check_attachments(
             problems.append(CheckProblem(
                 CHECK_ATTACHMENTS, _label(link.document),
                 "Приложение не закрепляет версию файла (ТЗ п.91).",
+                SEVERITY_WARNING,
             ))
     return problems
 

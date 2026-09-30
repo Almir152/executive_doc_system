@@ -210,6 +210,16 @@ def font_source() -> str:
     return _font_source
 
 
+def styles() -> dict:
+    """Стили печати. Открыто для сервисов комплекта (реестр выгрузки)."""
+    return _styles()
+
+
+def escape(text) -> str:
+    """Экранировать текст для reportlab."""
+    return _esc(text)
+
+
 def _styles() -> dict:
     """Стили печати по ТЗ п.59, 61.
 

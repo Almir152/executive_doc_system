@@ -24,12 +24,13 @@ from PyQt6.QtWidgets import (
 from app import settings
 from app.core import domain
 from app.core.services import document_service, form_service, issue_service
-from app.core.services import link_service, printing
+from app.core.services import link_service, package_service, printing
 from app.core.services import project_service as service
 from app.db.models import (
     ArchiveDocument, Document, Organization, Package,
 )
 from app.ui.document_form import DocumentFormPanel, DocumentFormWindow
+from app.ui.package_dialog import PackageDialog
 from app.ui.reference_picker import ReferenceMultiPicker, ReferencePicker
 from app.ui.section_dialog import SectionDialog, kind_options as db_kinds
 
@@ -471,6 +472,34 @@ class ProjectWindow(QWidget):
             QHeaderView.ResizeMode.Stretch
         )
         summary_layout.addWidget(self.history_table)
+
+        # ТЗ п.16: комплекты проекта видны рядом с документами, отдельный
+        # раздел «Реестры» в системе отсутствует (ТЗ п.68).
+        self.packages_box = QGroupBox("Комплекты проекта (ТЗ п.16, 69, 70)")
+        packages_layout = QVBoxLayout(self.packages_box)
+        package_buttons = QHBoxLayout()
+        self.btn_make_package = QPushButton("Сформировать комплект")
+        self.btn_make_package.clicked.connect(self.make_package)
+        package_buttons.addWidget(self.btn_make_package)
+        self.btn_open_package = QPushButton("Открыть папку комплекта")
+        self.btn_open_package.clicked.connect(self.open_package_folder)
+        package_buttons.addWidget(self.btn_open_package)
+        package_buttons.addStretch()
+        packages_layout.addLayout(package_buttons)
+
+        self.packages_table = QTableWidget(0, 5)
+        self.packages_table.setHorizontalHeaderLabels(
+            ["Комплект", "Дата", "Вариант", "Нумерация", "Состояние"]
+        )
+        self.packages_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.packages_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        packages_layout.addWidget(self.packages_table)
+        self.packages_hint = QLabel()
+        self.packages_hint.setWordWrap(True)
+        packages_layout.addWidget(self.packages_hint)
+        layout.addWidget(self.packages_box)
         layout.addWidget(self.summary_box)
 
     # -----------------------------------------------------------------
@@ -486,6 +515,7 @@ class ProjectWindow(QWidget):
         self._load_sections(project)
         self._load_documents(project)
         self._load_summary(project)
+        self._load_packages(project)
         self._load_history(project)
         self._reload_materials()
         self._reload_links()
@@ -601,6 +631,101 @@ class ProjectWindow(QWidget):
             f"Комплекты: {package_count}   •   "
             f"Представители: {len(project.representatives)}"
         )
+
+    def _load_packages(self, project) -> None:
+        """Комплекты проекта: новые сверху, состояние папки (ТЗ п.16, 73)."""
+        packages = package_service.list_packages(self.db, project.id)
+        self.packages_table.setRowCount(0)
+        for package in packages:
+            row = self.packages_table.rowCount()
+            self.packages_table.insertRow(row)
+            entries = package_service.package_entries(self.db, package.id)
+            state = "папка на месте"
+            if not package_service.package_exists_on_disk(package):
+                # ТЗ п.73: папку могли удалить или переместить.
+                state = "папка недоступна — выберите место заново"
+            values = [
+                package.folder_name,
+                package.created_at.strftime("%d.%m.%Y %H:%M"),
+                domain.EXPORT_VARIANT_LABELS.get(
+                    package.export_variant, package.export_variant
+                ),
+                "сквозная" if package.page_numbering else "без нумерации",
+                f"{state}, строк реестра: {len(entries)}",
+            ]
+            for column, value in enumerate(values):
+                self.packages_table.setItem(row, column, QTableWidgetItem(value))
+        self.packages_hint.setText(
+            "Отдельного раздела «Реестры» нет: реестр создаётся как часть "
+            "конкретной выгрузки (ТЗ п.68)."
+        )
+
+    def _selected_package(self):
+        row = self.packages_table.currentRow()
+        packages = package_service.list_packages(self.db, self.project_id)
+        if row < 0 or row >= len(packages):
+            return None
+        return packages[row]
+
+    def make_package(self) -> None:
+        """Сформировать комплект из выбранных документов (ТЗ п.69)."""
+        from app.core.services import export_checks
+
+        dialog = PackageDialog(self.db, self.project_id, self)
+        if dialog.exec() != PackageDialog.DialogCode.Accepted:
+            return
+        document_ids = dialog.selected_document_ids()
+
+        # ТЗ п.82: проверка до создания папки выгрузки.
+        result = export_checks.check_package(self.db, self.project_id, document_ids)
+        if result.has_errors:
+            answer = QMessageBox.question(
+                self, "Проверка комплекта (ТЗ п.82)",
+                "Обнаружены ошибки комплекта:\n\n"
+                + "\n".join(f"• {problem}" for problem in result.problems[:20])
+                + "\n\nСформировать комплект с файлом «Ошибки выгрузки.txt»?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            package = package_service.create_package(
+                self.db, self.project_id,
+                base_dir=dialog.base_dir,
+                root_name=dialog.root_name(),
+                document_ids=document_ids,
+                variant=dialog.variant(),
+                page_numbering=dialog.page_numbering(),
+                allow_errors=result.has_errors,
+            )
+        except (package_service.PackageError, printing.PrintError,
+                domain.UnknownLinkRole) as exc:
+            # ТЗ п.73: место хранения предлагается выбрать заново.
+            QMessageBox.warning(self, "Комплект не сформирован", str(exc))
+            return
+        self.reload()
+        QMessageBox.information(
+            self, "Комплект сформирован",
+            f"{package.folder_name}\n{package.absolute_path}",
+        )
+
+    def open_package_folder(self) -> None:
+        """Открыть папку комплекта; недоступная папка требует выбора заново."""
+        package = self._selected_package()
+        if package is None:
+            QMessageBox.information(
+                self, "Комплект", "Выберите комплект в списке (ТЗ п.16)."
+            )
+            return
+        if not package_service.package_exists_on_disk(package):
+            QMessageBox.warning(
+                self, "Папка комплекта недоступна (ТЗ п.73)",
+                f"Папка «{package.absolute_path}» удалена или перемещена.\n"
+                "Выберите папку комплектов заново при следующей выгрузке.",
+            )
+            return
+        _open_folder(package.absolute_path, self)
 
     def _load_history(self, project) -> None:
         events = service.list_events(self.db, project.id)
@@ -1216,6 +1341,23 @@ class ProjectWindow(QWidget):
             QMessageBox.warning(self, "Удаление невозможно", str(exc))
             return
         self._load_sections(service.get_project(self.db, self.project_id))
+
+
+def _open_folder(path: str, parent) -> None:
+    """Открыть папку комплекта в файловом менеджере (ТЗ п.16, 70)."""
+    folder = Path(path)
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(folder))  # noqa: S606 — папка выбрана оператором
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+    except (FileNotFoundError, OSError) as exc:
+        QMessageBox.information(
+            parent, "Комплект",
+            f"Папка комплекта: {folder}\nОткрыть её автоматически не удалось: {exc}",
+        )
 
 
 def _open_pdf(path: Path, parent) -> None:
