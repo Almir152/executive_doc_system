@@ -5,8 +5,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.models import (
-    ArchiveDocument, Document, DocumentVersion, HistoryEvent, Project,
-    ProjectSection,
+    ArchiveDocument, Document, DocumentVersion, HistoryEvent, Organization, Project,
+    ProjectSection, Representative, SectionKind,
 )
 
 
@@ -241,6 +241,69 @@ def list_sections(db: Session, project_id: int) -> list[ProjectSection]:
             .order_by(ProjectSection.code)
         ).all()
     )
+
+
+def update_section(
+    db: Session,
+    section_id: int,
+    *,
+    kind_id: int | None = None,
+    organization_id: int | None = None,
+    designer_rep_id: int | None = None,
+    sheets: str | None = None,
+    required_details: str | None = None,
+    name: str | None = None,
+) -> ProjectSection:
+    """Изменить реквизиты раздела (ТЗ п.21).
+
+    Код раздела не меняется: он участвует в именах папок комплекта (ТЗ п.70),
+    поэтому переименование потребовало бы пересборки уже выпущенного.
+    """
+    section = db.get(ProjectSection, section_id)
+    if section is None:
+        raise ProjectError(f"Раздел не найден: {section_id}")
+
+    if name is not None:
+        name = name.strip()
+        if not name:
+            raise ProjectError("Наименование раздела обязательно (ТЗ п.21).")
+        section.name = name
+
+    if kind_id is not None and kind_id != section.kind_id:
+        if db.get(SectionKind, kind_id) is None:
+            raise ProjectError(
+                f"Вид раздела не найден: {kind_id}. "
+                "Сначала заведите его в справочнике (ТЗ п.22)."
+            )
+        section.kind_id = kind_id
+
+    if organization_id is not None:
+        if db.get(Organization, organization_id) is None:
+            raise ProjectError(
+                f"Организация не найдена: {organization_id}. "
+                "Сначала заведите её в справочнике (ТЗ п.18)."
+            )
+        section.organization_id = organization_id
+
+    if designer_rep_id is not None:
+        if db.get(Representative, designer_rep_id) is None:
+            raise ProjectError(
+                f"Представитель не найден: {designer_rep_id}. "
+                "Сначала заведите его в справочнике (ТЗ п.19)."
+            )
+        section.designer_rep_id = designer_rep_id
+
+    if sheets is not None:
+        section.sheets = sheets.strip() or None
+    if required_details is not None:
+        section.required_details = required_details.strip() or None
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ProjectError(f"Не удалось сохранить раздел: {exc}") from exc
+    return section
 
 
 def delete_section(db: Session, section_id: int) -> None:

@@ -5,6 +5,8 @@
 документов ещё нет (ТЗ п.16).
 """
 
+from datetime import date, datetime
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
@@ -13,13 +15,99 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core import domain
+from app.core.services import document_service
 from app.core.services import project_service as service
 from app.db.models import (
-    ArchiveDocument, Document, Organization, Package, SectionKind,
+    ArchiveDocument, Organization, Package, SectionKind,
 )
 
 _DATA_ROLE = Qt.ItemDataRole.UserRole
 _CHECKABLE = Qt.ItemFlag.ItemIsUserCheckable
+
+
+class DocumentDialog(QDialog):
+    """Создание или правка реквизитов документа. ТЗ п.42, 43."""
+
+    def __init__(self, db, project_id, doc_type=None, document=None, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.project_id = project_id
+        self.document = document
+        if document is not None:
+            self.setWindowTitle("Реквизиты документа")
+            self.doc_type = document.doc_type
+        else:
+            self.setWindowTitle("Новый документ")
+            self.doc_type = doc_type
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.type_combo = QComboBox()
+        for value, label in domain.DOC_TYPE_LABELS.items():
+            self.type_combo.addItem(label, value)
+        index = self.type_combo.findData(self.doc_type)
+        if index >= 0:
+            self.type_combo.setCurrentIndex(index)
+        self.type_combo.setToolTip(
+            "Вид документа не меняется после создания"
+            if document is not None else "Вид документа по ТЗ п.42"
+        )
+        self.type_combo.setEnabled(document is None)
+        form.addRow("Вид документа", self.type_combo)
+
+        if document is None:
+            self.number_edit = QLineEdit(
+                document_service.next_document_number(
+                    db, project_id, self.doc_type
+                )
+            )
+        else:
+            self.number_edit = QLineEdit(document.number or "")
+        self.number_edit.setToolTip(
+            "Система предлагает номер, оператор может его изменить (ТЗ п.42)."
+        )
+        form.addRow("Номер *", self.number_edit)
+
+        self.date_edit = QLineEdit(
+            document.doc_date.strftime("%d.%m.%Y") if document and document.doc_date else ""
+        )
+        self.date_edit.setPlaceholderText("дд.мм.гггг")
+        self.date_edit.setToolTip(
+            "Дата вводится оператором и не изменяется системой (ТЗ п.43)."
+        )
+        form.addRow("Дата документа", self.date_edit)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict:
+        return {
+            "doc_type": self.type_combo.currentData(),
+            "number": self.number_edit.text(),
+            "doc_date": parse_ru_date(self.date_edit.text()),
+        }
+
+
+def parse_ru_date(text: str) -> date | None:
+    """Дата из поля ввода: дд.мм.гггг или пусто."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    for pattern in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, pattern).date()
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Дата «{text}» не распознана. Ожидается формат дд.мм.гггг (ТЗ п.43)."
+    )
 
 
 class ProjectCardDialog(QDialog):
@@ -168,18 +256,27 @@ class ProjectWindow(QWidget):
         layout.addWidget(self.sections_box)
 
         # ТЗ п.16: разделы документов создаются пустыми, если их ещё нет.
-        documents_box = QGroupBox("Документы (ТЗ п.16)")
+        documents_box = QGroupBox("Документы (ТЗ п.16, 42, 43)")
         documents_layout = QVBoxLayout(documents_box)
-        self.documents_table = QTableWidget(0, 4)
+        doc_buttons = QHBoxLayout()
+        self.btn_add_document = QPushButton("+ Документ")
+        self.btn_add_document.clicked.connect(self.add_document)
+        doc_buttons.addWidget(self.btn_add_document)
+        self.btn_edit_document = QPushButton("Изменить реквизиты")
+        self.btn_edit_document.clicked.connect(self.edit_document)
+        doc_buttons.addWidget(self.btn_edit_document)
+        doc_buttons.addStretch()
+        documents_layout.addLayout(doc_buttons)
+        self.documents_table = QTableWidget(0, 5)
         self.documents_table.setHorizontalHeaderLabels(
-            ["Тип", "Номер", "Статус", "Выпуски"]
+            ["Тип", "Номер", "Дата", "Статус", "Выпуски"]
         )
         self.documents_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
         documents_layout.addWidget(self.documents_table)
         self.documents_hint = QLabel(
-            "Документов пока нет. Формы появятся после создания комплектов."
+            "Документов пока нет. Создайте первый документ проекта."
         )
         self.documents_hint.setWordWrap(True)
         documents_layout.addWidget(self.documents_hint)
@@ -246,12 +343,7 @@ class ProjectWindow(QWidget):
                 self.sections_table.setItem(row, column, QTableWidgetItem(value))
 
     def _load_documents(self, project) -> None:
-        documents = (
-            self.db.query(Document)
-            .filter(Document.project_id == project.id)
-            .order_by(Document.doc_type, Document.number)
-            .all()
-        )
+        documents = document_service.list_documents(self.db, project.id)
         self.documents_table.setRowCount(len(documents))
         self.documents_hint.setVisible(not documents)
         for row, document in enumerate(documents):
@@ -259,6 +351,7 @@ class ProjectWindow(QWidget):
             values = [
                 domain.DOC_TYPE_LABELS.get(document.doc_type, document.doc_type),
                 document.number or "",
+                document.doc_date.strftime("%d.%m.%Y") if document.doc_date else "—",
                 _status_label(document.status),
                 str(issued),
             ]
@@ -343,6 +436,105 @@ class ProjectWindow(QWidget):
             QMessageBox.warning(self, "Раздел не добавлен", str(exc))
             return
         self._load_sections(service.get_project(self.db, self.project_id))
+
+    def add_document(self) -> None:
+        """Создать документ с предложенным номером (ТЗ п.42)."""
+        labels = list(domain.DOC_TYPE_LABELS.values())
+        choice, ok = QInputDialog.getItem(
+            self, "Новый документ", "Вид документа:", labels, 0, False
+        )
+        if not ok:
+            return
+        doc_type = next(
+            value for value, label in domain.DOC_TYPE_LABELS.items() if label == choice
+        )
+        dialog = DocumentDialog(self.db, self.project_id, doc_type=doc_type, parent=self)
+        try:
+            values = self._document_values(dialog)
+        except (ValueError, document_service.DocumentNumberError) as exc:
+            QMessageBox.warning(self, "Документ не создан", str(exc))
+            return
+        if values is None:
+            return
+        try:
+            document = document_service.create_document(self.db, self.project_id, **values)
+        except document_service.DocumentNumberError as exc:
+            QMessageBox.warning(self, "Документ не создан", str(exc))
+            return
+        service.record_event(
+            self.db, self.project_id, "document_created",
+            f"Создан документ {domain.DOC_TYPE_LABELS[document.doc_type]} "
+            f"№ {document.number}",
+            entity_type="document", entity_id=document.id,
+        )
+        self.db.commit()
+        self.reload()
+
+    def edit_document(self) -> None:
+        """Изменить номер и дату документа (ТЗ п.42, 43)."""
+        document = self._selected_document()
+        if document is None:
+            return
+        dialog = DocumentDialog(
+            self.db, self.project_id, document=document, parent=self
+        )
+        try:
+            values = self._document_values(dialog)
+        except (ValueError, document_service.DocumentNumberError) as exc:
+            QMessageBox.warning(self, "Не сохранено", str(exc))
+            return
+        if values is None:
+            return
+
+        number_changed = values["number"] != document.number
+        date_changed = values["doc_date"] != document.doc_date
+        if not number_changed and not date_changed:
+            return
+
+        if number_changed:
+            issued = any(v.issued_at is not None for v in document.versions)
+            if issued:
+                QMessageBox.warning(
+                    self, "Номер не меняется",
+                    "Номер выпущенного документа менять нельзя: он уже использован "
+                    "в комплекте (ТЗ п.85).",
+                )
+                return
+            document_service.validate_document_number(
+                self.db, self.project_id, document.doc_type, values["number"]
+            )
+            document.number = values["number"]
+        document.doc_date = values["doc_date"]
+
+        service.record_event(
+            self.db, self.project_id, "document_updated",
+            f"Изменены реквизиты документа "
+            f"{domain.DOC_TYPE_LABELS[document.doc_type]} № {document.number}",
+            entity_type="document", entity_id=document.id,
+        )
+        try:
+            self.db.commit()
+        except Exception as exc:  # noqa: BLE001 — причина показывается оператору
+            self.db.rollback()
+            QMessageBox.warning(self, "Не сохранено", f"Не удалось сохранить: {exc}")
+            return
+        self.reload()
+
+    def _document_values(self, dialog: DocumentDialog) -> dict | None:
+        """Реквизиты из диалога; None означает отказ оператора."""
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.values()
+
+    def _selected_document(self):
+        row = self.documents_table.currentRow()
+        documents = document_service.list_documents(self.db, self.project_id)
+        if row < 0 or row >= len(documents):
+            QMessageBox.information(
+                self, "Выберите документ", "Сначала выберите документ в перечне."
+            )
+            return None
+        return documents[row]
 
     def delete_section(self) -> None:
         row = self.sections_table.currentRow()
