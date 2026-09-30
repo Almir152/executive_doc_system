@@ -665,6 +665,9 @@ def create_package(
             "documents": len(plan.documents),
             "files": len(plan.files),
             "has_errors": checks.has_errors,
+            # Состав комплекта целиком: по нему история отвечает на вопрос
+            # «что было выгружено», даже если папка исчезла (ТЗ п.86).
+            "composition": package_composition(db, package.id),
         },
     )
     db.commit()
@@ -701,6 +704,56 @@ def package_entries(db: Session, package_id: int) -> list[PackageEntry]:
             .order_by(PackageEntry.register_row_no)
         ).all()
     )
+
+
+def package_composition(db: Session, package_id: int) -> dict:
+    """Состав комплекта по данным базы (ТЗ п.86).
+
+    Сводка нужна истории: по ней видно, что именно было выгружено, даже если
+    папку позже переместили или удалили. Считается по строкам реестра, а не по
+    файлам на диске, поэтому результат не зависит от состояния папки.
+    """
+    package = db.get(Package, package_id)
+    if package is None:
+        raise PackageError(f"Комплект не найден: {package_id}")
+
+    documents: dict[str, list[str]] = {}
+    files: dict[str, list[str]] = {}
+    for entry in package_entries(db, package_id):
+        if entry.document_id is not None:
+            documents.setdefault(entry.doc_type, []).append(
+                f"{entry.doc_type} {entry.document_number}".strip()
+            )
+        elif entry.doc_type != REGISTER_OF_ATTACHMENTS:
+            files.setdefault(entry.doc_type, []).append(entry.document_number)
+
+    return {
+        "package_id": package.id,
+        "folder_name": package.folder_name,
+        "variant": package.export_variant,
+        "page_numbering": bool(package.page_numbering),
+        "has_errors": bool(package.has_errors_file),
+        "registry_rows": len(package_entries(db, package_id)),
+        "documents": documents,
+        "files": files,
+    }
+
+
+def composition_text(composition: dict) -> str:
+    """Сводка состава для события истории (ТЗ п.86)."""
+    lines = [
+        f"Состав комплекта «{composition['folder_name']}»: "
+        f"вариант {domain.EXPORT_VARIANT_LABELS.get(composition['variant'], '')}, "
+        f"строк реестра {composition['registry_rows']}"
+    ]
+    for doc_type, items in composition["documents"].items():
+        lines.append(f"документы: {doc_type} — {len(items)} шт.")
+    for category, items in composition["files"].items():
+        lines.append(f"файлы: {category} — {len(items)} шт.")
+    if composition["has_errors"]:
+        lines.append("выгрузка с пометкой об ошибках (ТЗ п.83)")
+    return "\n".join(lines)
+
 
 
 def package_exists_on_disk(package: Package) -> bool:

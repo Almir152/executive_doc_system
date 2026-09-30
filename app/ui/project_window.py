@@ -17,8 +17,8 @@ from PyQt6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
     QFileDialog, QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox,
     QPushButton,
-    QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-    QWidget,
+    QTableWidget, QTableWidgetItem, QTextEdit, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from app import settings
@@ -27,7 +27,7 @@ from app.core.services import document_service, form_service, issue_service
 from app.core.services import link_service, package_service, printing
 from app.core.services import project_service as service
 from app.db.models import (
-    ArchiveDocument, Document, Organization, Package,
+    ArchiveDocument, Document, HistoryEvent, Organization, Package,
 )
 from app.ui.document_form import DocumentFormPanel, DocumentFormWindow
 from app.ui.package_dialog import PackageDialog
@@ -513,7 +513,15 @@ class ProjectWindow(QWidget):
         self.history_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
+        self.history_table.itemSelectionChanged.connect(self.show_history_details)
         summary_layout.addWidget(self.history_table)
+
+        # ТЗ п.86: по событию комплекта видно, что именно было выгружено.
+        self.history_details = QTextEdit()
+        self.history_details.setReadOnly(True)
+        self.history_details.setMaximumHeight(120)
+        self.history_details.setVisible(False)
+        summary_layout.addWidget(self.history_details)
 
         # ТЗ п.16: комплекты проекта видны рядом с документами, отдельный
         # раздел «Реестры» в системе отсутствует (ТЗ п.68).
@@ -779,7 +787,29 @@ class ProjectWindow(QWidget):
                 event.message or "",
             ]
             for column, value in enumerate(values):
-                self.history_table.setItem(row, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, event.id)
+                self.history_table.setItem(row, column, item)
+
+    def show_history_details(self) -> None:
+        """Показать состав комплекта по выбранному событию (ТЗ п.86)."""
+        rows = self.history_table.selectionModel().selectedRows()
+        if not rows:
+            self.history_details.setVisible(False)
+            return
+        item = self.history_table.item(rows[0].row(), 0)
+        event = self.db.get(HistoryEvent, item.data(Qt.ItemDataRole.UserRole)) if item else None
+        if event is None or event.event_type != domain.HISTORY_PACKAGE_EXPORTED:
+            self.history_details.setVisible(False)
+            return
+        composition = (event.payload or {}).get("composition")
+        if not composition:
+            self.history_details.setVisible(False)
+            return
+        self.history_details.setPlainText(
+            package_service.composition_text(composition)
+        )
+        self.history_details.setVisible(True)
 
     # -----------------------------------------------------------------
     # ДЕЙСТВИЯ

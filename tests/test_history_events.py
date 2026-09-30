@@ -119,6 +119,75 @@ def test_register_counts_attachments(db, project, aosr, tmp_path):
 
 
 # =====================================================================
+# СОСТАВ КОМПЛЕКТА В ИСТОРИИ (ТЗ п.86)
+# =====================================================================
+
+
+def test_history_event_keeps_package_composition(db, project, package):
+    """По событию видно, что именно было выгружено (ТЗ п.86)."""
+    event = next(
+        event for event in project_service.list_events(db, project.id)
+        if event.event_type == domain.HISTORY_PACKAGE_EXPORTED
+    )
+    composition = event.payload["composition"]
+    assert composition["folder_name"] == package.folder_name
+    assert composition["registry_rows"] >= 1
+    assert composition["documents"][domain.DOC_TYPE_AOSR] == ["АОСР 1"]
+
+
+def test_composition_lists_files_by_category(db, project, aosr, tmp_path):
+    """Файлы комплекта видны по категориям архива (ТЗ п.50, 86)."""
+    source = tmp_path / "СХЕМА №2.pdf"
+    source.write_bytes(b"%PDF-1.4 scheme")
+    scheme = storage_service.add_file_to_archive(
+        db, src_path=source, project_id=project.id,
+        category=domain.ARCHIVE_CATEGORY_SCHEMES,
+    )
+    link_service.link_document_to_archive(
+        db, document_id=aosr.id, archive_document_id=scheme.id,
+        link_role=domain.LINK_ROLE_SCHEME,
+    )
+    issue_service.issue_document(db, aosr.id)
+    package = package_service.create_package(
+        db, project.id, base_dir=tmp_path, allow_errors=True
+    )
+
+    composition = package_service.package_composition(db, package.id)
+    assert composition["files"][domain.ARCHIVE_CATEGORY_SCHEMES] == ["СХЕМА №2.pdf"]
+
+
+def test_composition_text_is_readable(db, project, package):
+    """Сводка состава читается оператором, а не разбирается в JSON."""
+    composition = package_service.package_composition(db, package.id)
+    text = package_service.composition_text(composition)
+    assert package.folder_name in text
+    assert "строк реестра" in text
+    assert domain.DOC_TYPE_AOSR in text
+
+
+def test_composition_survives_missing_package_folder(db, project, package, tmp_path):
+    """Состав известен, даже если папку выгрузки удалили (ТЗ п.73, 86)."""
+    import shutil
+
+    shutil.rmtree(package.absolute_path)
+    assert not package_service.package_exists_on_disk(package)
+
+    composition = package_service.package_composition(db, package.id)
+    assert composition["registry_rows"] >= 1
+    event = next(
+        event for event in project_service.list_events(db, project.id)
+        if event.event_type == domain.HISTORY_PACKAGE_EXPORTED
+    )
+    assert event.payload["composition"]["folder_name"] == package.folder_name
+
+
+def test_composition_of_unknown_package_is_refused(db):
+    """Нет такого комплекта — понятная ошибка, а не пустая сводка."""
+    with pytest.raises(package_service.PackageError):
+        package_service.package_composition(db, 999999)
+
+
+# =====================================================================
 # ИСТОРИЧЕСКИЕ PDF (ТЗ п.86)
 # =====================================================================
 
@@ -200,4 +269,38 @@ def test_window_print_records_pdf_in_history(db, aosr, qapp, monkeypatch, tmp_pa
     event = project_service.list_events(db, aosr.project_id)[0]
     assert event.event_type == domain.HISTORY_PDF_SAVED
     assert target.exists()
+    window.close()
+
+
+@pytest.mark.gui
+def test_history_shows_package_composition(db, project, package, qapp):
+    """Состав комплекта открывается по событию истории (ТЗ п.86)."""
+    from PyQt6.QtCore import Qt
+
+    from app.ui.project_window import ProjectWindow
+
+    window = ProjectWindow(db, project.id)
+    window.show()
+    window.reload()
+
+    row = next(
+        index for index in range(window.history_table.rowCount())
+        if window.history_table.item(index, 1).text()
+        == domain.HISTORY_PACKAGE_EXPORTED
+    )
+    window.history_table.selectRow(row)
+    assert window.history_details.isVisible() is True
+    text = window.history_details.toPlainText()
+    assert package.folder_name in text
+    assert "строк реестра" in text
+
+    other = next(
+        index for index in range(window.history_table.rowCount())
+        if window.history_table.item(index, 1).text()
+        != domain.HISTORY_PACKAGE_EXPORTED
+    )
+    window.history_table.clearSelection()
+    window.history_table.selectRow(other)
+    assert window.history_details.isVisible() is False
+    assert window.history_table.item(row, 2).data(Qt.ItemDataRole.UserRole)
     window.close()
