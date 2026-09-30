@@ -699,6 +699,126 @@ def render_documents_pdf(
     return output_path
 
 
+def render_project_report(
+    db: Session, project: Project, output_path: Path | str
+) -> Path:
+    """Ведомость состава проекта по рабочему дереву (ТЗ п.16).
+
+    ТЗ требует дерево «Акты испытаний / АОСР / АООК / АОУСИТО / Связанные
+    документы / Комплекты / История» (ТЗ п.16) и печать документов по формам
+    (ТЗ п.55–62). Отдельного требования печатать само дерево в ТЗ нет, поэтому
+    это внутренний отчёт оператора: состав проекта на бумаге. Поля и шрифты —
+    те же, что у печатных форм (ТЗ п.59, 60).
+    """
+    from app.core.services import package_service
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    styles = _styles()
+
+    documents = (
+        db.query(Document)
+        .filter(Document.project_id == project.id)
+        .order_by(Document.doc_type, Document.number, Document.id)
+        .all()
+    )
+    by_type: dict[str, list[Document]] = {}
+    for document in documents:
+        by_type.setdefault(document.doc_type, []).append(document)
+
+    story: list = [
+        Paragraph("СОСТАВ ПРОЕКТА", styles["title"]),
+        Paragraph(_esc(project.title or ""), styles["center"]),
+        Paragraph(_esc(project.address or ""), styles["center"]),
+        Spacer(1, 6),
+    ]
+
+    for doc_type in domain.NUMBERED_DOC_TYPES:
+        items = by_type.get(doc_type, [])
+        story.append(Paragraph(_esc(doc_type), styles["heading"]))
+        if not items:
+            story.append(Paragraph("документов нет", styles["fill"]))
+            continue
+        for document in items:
+            version = form_service.actual_version(db, document.id)
+            issued = version is not None and version.issued_at is not None
+            story.append(Paragraph(
+                f"{_esc(document.number or 'без номера')} — "
+                f"{'выпущен' if issued else 'черновик'}"
+                + (f", дата {_esc(_format_date(document.doc_date))}"
+                   if document.doc_date else ""),
+                styles["fill"],
+            ))
+
+    schemes = _archive_by_role(db, project.id, domain.LINK_ROLE_SCHEME)
+    others = _archive_by_role(db, project.id, domain.LINK_ROLE_ATTACHMENT)
+    story.append(Paragraph("Связанные документы", styles["heading"]))
+    if schemes:
+        for name in schemes:
+            story.append(Paragraph(f"исполнительная схема: {_esc(name)}",
+                                    styles["fill"]))
+    for name in others:
+        story.append(Paragraph(f"приложение: {_esc(name)}", styles["fill"]))
+    if not schemes and not others:
+        story.append(Paragraph("файлы не привязаны", styles["fill"]))
+
+    packages = package_service.list_packages(db, project.id)
+    story.append(Paragraph("Комплекты", styles["heading"]))
+    if packages:
+        for package in packages:
+            story.append(Paragraph(
+                f"{_esc(package.folder_name)} — "
+                f"{_esc(domain.EXPORT_VARIANT_LABELS.get(package.export_variant, ''))}"
+                + (", с пометкой об ошибках" if package.has_errors_file else ""),
+                styles["fill"],
+            ))
+    else:
+        story.append(Paragraph("комплектов нет", styles["fill"]))
+
+    size = A4
+    doc = BaseDocTemplate(
+        str(path), pagesize=size,
+        leftMargin=MARGIN_LEFT_MM * mm, rightMargin=MARGIN_RIGHT_MM * mm,
+        topMargin=MARGIN_TOP_MM * mm, bottomMargin=MARGIN_BOTTOM_MM * mm,
+        title="Состав проекта",
+        author="Исполнительная документация",
+    )
+    frame = Frame(
+        MARGIN_LEFT_MM * mm, MARGIN_BOTTOM_MM * mm,
+        size[0] - (MARGIN_LEFT_MM + MARGIN_RIGHT_MM) * mm,
+        size[1] - (MARGIN_TOP_MM + MARGIN_BOTTOM_MM) * mm,
+        id="project",
+    )
+    doc.addPageTemplates([PageTemplate(id="project", frames=[frame])])
+    doc.build(story)
+    return path
+
+
+def _archive_by_role(db: Session, project_id: int, role: str) -> list[str]:
+    """Имена архивных файлов, связанных с документами проекта (ТЗ п.49)."""
+    document_ids = [
+        row.id for row in db.query(Document.id).filter(
+            Document.project_id == project_id
+        )
+    ]
+    if not document_ids:
+        return []
+    links = (
+        db.query(DocumentArchiveLink)
+        .filter(
+            DocumentArchiveLink.document_id.in_(document_ids),
+            DocumentArchiveLink.link_role == role,
+        )
+        .all()
+    )
+    names: list[str] = []
+    for link in links:
+        archive = db.get(ArchiveDocument, link.archive_document_id)
+        if archive is not None:
+            names.append(archive.original_name)
+    return sorted(set(names))
+
+
 def render_document_pdf(
     db: Session,
     document: Document,

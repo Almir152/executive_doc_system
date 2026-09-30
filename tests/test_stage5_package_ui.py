@@ -297,3 +297,48 @@ def test_open_folder_calls_file_manager(
 
     assert opened == [package.absolute_path]
     window.close()
+
+
+def test_print_project_report_button_saves_pdf(
+    qapp, db, project, section, aosr, tmp_path, monkeypatch
+):
+    """Кнопка печати состава проекта сохраняет ведомость (ТЗ п.16)."""
+    from pypdf import PdfReader
+
+    target = tmp_path / "состав.pdf"
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), ""))
+    )
+    monkeypatch.setattr("app.ui.project_window._open_pdf", lambda p, w: None)
+    monkeypatch.setattr(
+        QMessageBox, "information", staticmethod(lambda *a, **k: None)
+    )
+
+    window = ProjectWindow(db, project.id)
+    window.btn_print_project.click()
+
+    assert target.is_file()
+    text = "\n".join(
+        page.extract_text() or "" for page in PdfReader(str(target)).pages
+    )
+    assert "СОСТАВ ПРОЕКТА" in text
+    assert aosr.number in text
+    window.close()
+
+
+def test_print_project_report_can_be_cancelled(
+    qapp, db, project, section, aosr, monkeypatch
+):
+    """Отмена сохранения не печатает и не ругается (ТЗ п.16)."""
+    from PyQt6.QtWidgets import QMessageBox as Box
+
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: ("", ""))
+    )
+    monkeypatch.setattr(
+        Box, "information", staticmethod(lambda *a, **k: pytest.fail("печать отменена"))
+    )
+
+    window = ProjectWindow(db, project.id)
+    window.btn_print_project.click()
+    window.close()

@@ -316,3 +316,40 @@ def test_full_scenario_normative_basis_is_visible(db, project):
         assert proposal.basis["document"]
         assert proposal.basis["section"]
         assert normative.format_basis(proposal.basis) != "основание не указано"
+
+
+def test_project_report_prints_tree(db, project, tmp_path):
+    """Ведомость состава проекта печатается по дереву (ТЗ п.16)."""
+    from app.core.services import printing
+
+    aosr = _act(
+        db, project, domain.DOC_TYPE_AOSR, "1", AOSR_PAYLOAD,
+        "01.04.2024", "30.04.2024",
+    )
+    issue_service.issue_document(db, aosr.id)
+    _act(db, project, domain.DOC_TYPE_AOOK, "1", AOSR_PAYLOAD,
+         "01.04.2024", "30.04.2024", doc_date=date(2024, 5, 10))
+    export_package(db, project.id, tmp_path / "выгрузка", allow_errors=True)
+
+    target = printing.render_project_report(db, project, tmp_path / "отчёт.pdf")
+    assert target.is_file()
+    assert printing.page_count(target) >= 1
+
+    from pypdf import PdfReader
+
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(str(target)).pages)
+    assert "СОСТАВ ПРОЕКТА" in text
+    assert domain.DOC_TYPE_AOSR in text
+    assert domain.DOC_TYPE_AOOK in text
+    assert "Комплекты" in text
+
+
+def test_project_report_of_empty_project(db, project, tmp_path):
+    """Пустой проект тоже печатается: разделы видны как «нет документов»."""
+    from app.core.services import printing
+    from pypdf import PdfReader
+
+    target = printing.render_project_report(db, project, tmp_path / "пусто.pdf")
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(str(target)).pages)
+    assert "документов нет" in text
+    assert "комплектов нет" in text

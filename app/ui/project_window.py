@@ -534,6 +534,11 @@ class ProjectWindow(QWidget):
         self.btn_open_package = QPushButton("Открыть папку комплекта")
         self.btn_open_package.clicked.connect(self.open_package_folder)
         package_buttons.addWidget(self.btn_open_package)
+        # Ведомость состава проекта — рабочий отчёт оператора по дереву
+        # проекта (ТЗ п.16); печатные формы документов печатаются отдельно.
+        self.btn_print_project = QPushButton("Печать состава проекта")
+        self.btn_print_project.clicked.connect(self.print_project_report)
+        package_buttons.addWidget(self.btn_print_project)
         package_buttons.addStretch()
         packages_layout.addLayout(package_buttons)
 
@@ -1394,6 +1399,29 @@ class ProjectWindow(QWidget):
         QMessageBox.information(
             self, "Форма напечатана",
             f"Файл сохранён: {path} (ТЗ п.55–62).",
+        )
+
+    def print_project_report(self) -> None:
+        """Напечатать ведомость состава проекта (ТЗ п.16)."""
+        project = service.get_project(self.db, self.project_id)
+        if project is None:
+            return
+        safe_title = re.sub(r"[^\w\-]+", "_", project.title or "проект")
+        suggested = Path.home() / f"Состав_{safe_title}.pdf"
+        target, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить ведомость состава проекта", str(suggested),
+            "PDF (*.pdf)",
+        )
+        if not target:
+            return
+        try:
+            path = printing.render_project_report(self.db, project, target)
+        except printing.PrintError as exc:
+            QMessageBox.warning(self, "Ведомость не напечатана", str(exc))
+            return
+        os.startfile(path) if sys.platform == "win32" else _open_pdf(path, self)
+        QMessageBox.information(
+            self, "Ведомость напечатана", f"Файл сохранён: {path} (ТЗ п.16).",
         )
 
     def issue_document(self) -> None:
