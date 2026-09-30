@@ -27,6 +27,9 @@ def _complete_payload(**extra) -> dict:
         "work_description": "Армирование стен, 120 м²",
         "section_refs": "КЖ",
         "work_period": "с 01.04.2024 по 30.04.2024",
+        # ТЗ п.43, 87: срок работ двумя датами для проверки зависимостей.
+        "period_start": "01.04.2024",
+        "period_end": "30.04.2024",
         "work_volume": "120 м² бетона Б25",
         "has_defects": "Нет",
         "conclusion": "Работы выполнены в полном объёме",
@@ -63,8 +66,23 @@ def test_draft_can_be_saved_with_validation(db, aosr):
 
 
 def test_draft_with_validation_passes_when_complete(db, aosr):
+    from app.core.forms import NormativeFormDefinition
+    from app.db.form_definitions import FORM_DEFINITIONS
+
     form_service.save_draft(db, aosr.id, _complete_payload(), validate=True)
-    assert len(form_service.load_draft(db, aosr.id)) == 9
+
+    definition = next(
+        NormativeFormDefinition.from_dict(raw)
+        for raw in FORM_DEFINITIONS if raw["doc_type"] == domain.DOC_TYPE_AOSR
+    )
+    required = [
+        block.key for section in definition.sections for block in section.blocks
+        if block.required
+    ]
+    payload = form_service.load_draft(db, aosr.id)
+    assert set(required) == set(payload), (
+        "проверка обязательных полей должна закрывать все требуемые поля формы"
+    )
 
 
 def test_unsaved_work_is_detected(db, aosr):

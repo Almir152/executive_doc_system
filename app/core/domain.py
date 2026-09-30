@@ -116,6 +116,9 @@ LINK_ROLE_QUALITY = "Документ качества"
 LINK_ROLE_SCHEME = "Исполнительная схема"
 LINK_ROLE_PROTOCOL = "Протокол"
 LINK_ROLE_ATTACHMENT = "Приложение"
+# ТЗ п.43, 87: итоговый акт завершает перечисленные акты. Эта связь нужна
+# для проверки логических зависимостей дат.
+LINK_ROLE_FINALIZES = "Завершает акт"
 LINK_ROLE_TEST_PROTOCOL = "Протокол испытаний"
 LINK_ROLE_SURVEY = "Обследование"
 LINK_ROLES = (
@@ -126,6 +129,12 @@ LINK_ROLES = (
     LINK_ROLE_ATTACHMENT,
     LINK_ROLE_TEST_PROTOCOL,
     LINK_ROLE_SURVEY,
+)
+
+# --- Раздел 43 / 87. Связи между документами ----------------------------
+# Эти роли не хранятся в архиве: они связывают документы проекта между собой.
+DOCUMENT_LINK_ROLES = (
+    LINK_ROLE_FINALIZES,
 )
 
 # --- Раздел 30 / 47 / 48. Роли перечней в описаниях нормативных форм -----
@@ -224,6 +233,7 @@ HISTORY_LINK_ADDED = "link_added"
 HISTORY_LINK_REMOVED = "link_removed"
 HISTORY_ARCHIVE_FILE_ADDED = "archive_file_added"
 HISTORY_ARCHIVE_VERSION_ADDED = "archive_version_added"
+HISTORY_ARCHIVE_QUALITY_SET = "archive_quality_set"
 HISTORY_PACKAGE_EXPORTED = "package_exported"
 HISTORY_AI_PROPOSED = "ai_proposed"
 HISTORY_AI_ACTION_APPLIED = "ai_action_applied"

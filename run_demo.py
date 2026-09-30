@@ -36,7 +36,8 @@ from app.core.services.storage_service import (  # noqa: E402
 from app.db.database import SessionLocal, check_integrity, get_schema_version, init_db  # noqa: E402
 from app.db.migrations import SCHEMA_VERSION  # noqa: E402
 from app.db.models import (  # noqa: E402
-    ArchiveDocument, Direction, Document, DocumentArchiveLink, Project,
+    ArchiveDocument, Direction, Document, DocumentArchiveLink, DocumentLink,
+    DocumentVersion, Package, PackageEntry, Project,
 )
 
 FAILURES: list[str] = []
@@ -93,6 +94,71 @@ def main() -> int:
     )
     print(f"[+] Добавлены акты: {aosr1.type_label} №1 и {aosr1.type_label} №2")
 
+    # --- Сроки работ и связь итогового акта с АОСР (ТЗ п.43, 87) ---
+    from datetime import date as _date
+
+    from app.core.services import form_service, link_service
+    from app.core.services.issue_service import IssueError, issue_document
+
+    form_service.save_draft(db, aosr1.id, {
+        "object_name": "Корпус 2", "address": project.address,
+        "work_description": "Армирование стен, 120 м²", "section_refs": "",
+        "work_period": "с 01.04.2024 по 30.04.2024",
+        "period_start": "01.04.2024", "period_end": "30.04.2024",
+        "work_volume": "120 м² бетона Б25", "has_defects": "Нет",
+        "conclusion": "Работы выполнены в полном объёме",
+        "work_performer": "ООО «Строй»",
+    })
+    aook = Document(
+        project_id=project.id, doc_type=domain.DOC_TYPE_AOOK, number="1",
+        doc_date=_date(2024, 5, 15),
+    )
+    db.add(aook)
+    db.commit()
+
+    def _aook_payload(start: str, end: str) -> dict:
+        return {
+            "object_name": "Корпус 2", "address": project.address,
+            "work_description": "Приёмка завершённых работ",
+            "base_documents": "Договор №12 от 01.03.2024",
+            "period_start": start, "period_end": end,
+            "work_volume": "120 м² бетона Б25",
+            "decisions": "Принято без замечаний",
+        }
+
+    # Итоговый акт завершает АОСР №1: связь выбирает оператор.
+    link_service.link_documents(
+        db, document_id=aook.id, related_document_id=aosr1.id,
+        link_role=domain.LINK_ROLE_FINALIZES,
+    )
+    check("связь «завершает акт» создана (ТЗ п.87)",
+          [item.number for item in link_service.finalized_acts(db, aook.id)] == ["1"])
+
+    # Даты противоречат друг другу: система обязана отказать, но не править их.
+    form_service.save_draft(db, aook.id, _aook_payload("01.03.2024", "20.03.2024"))
+    check("система не подставляет даты сама (ТЗ п.43)",
+          form_service.load_draft(db, aook.id)["period_end"] == "20.03.2024")
+    try:
+        issue_document(db, aook.id)
+        check("выпуск с неверным порядком дат отклонён (ТЗ п.87, 96)", False,
+              "выпуск состоялся")
+    except IssueError as exc:
+        check("выпуск с неверным порядком дат отклонён (ТЗ п.87, 96)",
+              any("раньше окончания" in text for text in exc.problems),
+              f"причина: {exc.problems[0][:70]}")
+
+    form_service.save_draft(db, aook.id, _aook_payload("01.04.2024", "31.05.2024"))
+    version = issue_document(db, aook.id)
+    check("после исправления дат итоговый акт выпущен (ТЗ п.87)",
+          version.is_actual is True)
+
+    # Выпуск — исторический результат: проект с ним удалить нельзя (ТЗ п.54, 85).
+    try:
+        delete_project(db, project.id)
+        check("проект с выпуском не удаляется (ТЗ п.54, 85)", False, "удалён")
+    except ProjectError as exc:
+        check("проект с выпуском не удаляется (ТЗ п.54, 85)",
+              "выпущенных версий" in str(exc), str(exc)[:60])
     # --- Архив: дедупликация (ТЗ п.84, 92) ---
     with tempfile.TemporaryDirectory() as tmp:
         scheme = Path(tmp) / "Схема №12.pdf"
@@ -207,6 +273,23 @@ def main() -> int:
     delete_archive_document(db, archive_doc.id)
     check("архивный документ удалён после снятия связей",
           db.query(ArchiveDocument).count() == 0)
+
+    # Выпуск итогового акта — исторический результат (ТЗ п.54, 85): ради
+    # чистого финала демонстрации он снимается явно, вместе со связями актов.
+    for link in db.query(DocumentLink).all():
+        db.delete(link)
+    # Реестр комплекта ссылается на выпущенную версию: сначала комплект.
+    db.query(PackageEntry).delete()
+    db.query(Package).delete()
+    db.delete(version)
+    db.commit()
+    check("демонстрационные связи и выпуск сняты перед удалением проекта",
+          db.query(DocumentLink).count() == 0
+          and db.query(DocumentVersion).filter(
+              DocumentVersion.issued_at.isnot(None)
+          ).count() == 0)
+
+    # Черновики — рабочие данные (ТЗ п.66) и удаляются вместе с проектом.
     delete_project(db, project.id)
     check("проект без архива удаляется", db.query(Project).count() == 0)
     check("документы проекта удалены каскадом",
@@ -216,7 +299,6 @@ def main() -> int:
 
     print("\n=== НЕ РЕАЛИЗОВАНО ===")
     print("  - история по комплектам, реестрам и историческим PDF (п.86)")
-    print("  - проверки логических дат между документами (п.87)")
     print("  - связь акта испытаний со строкой материала (п.44-48)")
     print("  - BACKUP, восстановление и перенос (п.74, 98)")
     print("  - обновление через миграции (п.97)")

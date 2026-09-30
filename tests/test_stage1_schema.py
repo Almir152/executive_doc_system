@@ -18,7 +18,9 @@ from app.core.services.storage_service import (
     find_missing_files, find_orphan_files,
 )
 from app.db.migrations import SCHEMA_VERSION, apply_migrations
-from app.db.models import ArchiveFileVersion, Document, DocumentVersion
+from app.db.models import (
+    ArchiveFileVersion, Document, DocumentLink, DocumentVersion,
+)
 
 
 # =====================================================================
@@ -694,6 +696,7 @@ def test_migration_of_already_migrated_database_adds_only_new_steps(tmp_path):
         "add_lookup_indexes",
         "protect_issued_document_versions",
         "restore_version_number_uniqueness",
+        "document_dates_and_links",
     ], f"неожиданный набор шагов: {applied}"
 
     raw = own_engine.raw_connection()
@@ -1032,6 +1035,7 @@ def test_migration_003_protects_issued_versions_of_legacy_v2_database(tmp_path):
 
     assert apply_migrations(own_engine) == [
         "protect_issued_document_versions", "restore_version_number_uniqueness",
+        "document_dates_and_links",
     ]
 
     raw = sqlite3.connect(db_path)
@@ -1514,3 +1518,47 @@ def test_migrations_alone_restore_uniqueness_without_model_help(db, project):
         ), "миграции не восстановили уникальность без create_all"
     finally:
         conn.close()
+
+
+def test_migration_005_adds_document_links(db, project):
+    """Связи между документами появляются при обновлении.
+
+    Без них не проверяется логика дат (ТЗ п.87), поэтому обновление с версии
+    4 обязано добавить таблицу, не меняя имеющиеся данные.
+    """
+    from app.db.database import engine
+    from app.db.migrations import apply_migrations, table_exists
+
+    aosr = Document(project_id=project.id, doc_type="АОСР", number="1")
+    db.add(aosr)
+    db.commit()
+
+    # Схема в состоянии до обновления: таблицы связей нет.
+    raw = engine.raw_connection()
+    try:
+        raw.execute("DROP TABLE document_links")
+        raw.execute("PRAGMA user_version = 4")
+        raw.commit()
+        assert not table_exists(raw, "document_links")
+    finally:
+        raw.close()
+
+    assert "document_dates_and_links" in apply_migrations(engine)
+
+    raw = engine.raw_connection()
+    try:
+        assert table_exists(raw, "document_links")
+        assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        raw.close()
+
+    # Данные оператора на месте, связь документов записывается и читается.
+    aook = Document(project_id=project.id, doc_type="АООК", number="1")
+    db.add(aook)
+    db.commit()
+    db.add(DocumentLink(document_id=aook.id, related_document_id=aosr.id,
+                        link_role="Завершает акт"))
+    db.commit()
+    db.refresh(aook)
+    assert aook.document_links[0].related_document.number == "1"
+    assert db.query(Document).count() == 2

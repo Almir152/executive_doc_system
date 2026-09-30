@@ -16,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import utcnow
-from app.core import domain
+from app.core import domain, validators
 from app.core.services import document_service, form_service
 from app.core.services.project_service import record_event
 from app.db.models import Document, DocumentVersion
@@ -105,6 +105,10 @@ def issue_document(
             "(ТЗ п.85)."
         )
     problems.extend(form_service.check_payload(db, document_id, payload))
+
+    # ТЗ п.43, 87, 96: логические зависимости дат проверяются до выпуска,
+    # иначе в зафиксированную версию попал бы акт с невозможным сроком.
+    problems.extend(validators.check_document_dates(db, document))
 
     # Дату система не назначает сама: она либо уже введена оператором, либо
     # передана сюда. Подставлять «сегодня» нельзя (ТЗ п.43).

@@ -14,9 +14,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import domain
+from app.core.services.project_service import record_event
 from app.db.models import (
-    ArchiveDocument, ArchiveFileVersion, Document, DocumentArchiveLink, Material,
-    MaterialType, Project,
+    ArchiveDocument, ArchiveFileVersion, Document, DocumentArchiveLink, DocumentLink,
+    Material, MaterialType, Project,
 )
 
 
@@ -190,6 +191,19 @@ def link_document_to_archive(
     )
     db.add(link)
     try:
+        db.flush()
+        record_event(
+            db, document.project_id, domain.HISTORY_LINK_ADDED,
+            f"{document.type_label} № {document.number}: связь «{link_role}» "
+            f"с файлом «{archive_document.original_name}» (ТЗ п.45, 86)",
+            entity_type="document", entity_id=document.id,
+            payload={
+                "link_role": link_role,
+                "archive_document_id": archive_document.id,
+                "archive_version_id": version_id,
+                "link_id": link.id,
+            },
+        )
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -218,7 +232,20 @@ def unlink_document_from_archive(db: Session, link_id: int) -> None:
     link = db.get(DocumentArchiveLink, link_id)
     if link is None:
         raise MaterialError(f"Связь не найдена: {link_id}")
+    document = link.document
+    name = link.archive_document.original_name if link.archive_document else "—"
     db.delete(link)
+    db.flush()
+    record_event(
+        db, document.project_id, domain.HISTORY_LINK_REMOVED,
+        f"{document.type_label} № {document.number}: связь «{link.link_role}» "
+        f"с файлом «{name}» удалена; файл остаётся в архиве (ТЗ п.52, 86)",
+        entity_type="document", entity_id=document.id,
+        payload={
+            "link_role": link.link_role,
+            "archive_document_id": link.archive_document_id,
+        },
+    )
     db.commit()
 
 
@@ -242,3 +269,166 @@ def archive_links_count(db: Session, archive_document_id: int) -> int:
         .select_from(DocumentArchiveLink)
         .where(DocumentArchiveLink.archive_document_id == archive_document_id)
     ) or 0
+
+
+# =====================================================================
+# СВЯЗИ МЕЖДУ ДОКУМЕНТАМИ (ТЗ п.43, 87, 88, 89)
+# =====================================================================
+
+def link_documents(
+    db: Session,
+    *,
+    document_id: int,
+    related_document_id: int,
+    link_role: str = domain.LINK_ROLE_FINALIZES,
+    order_no: int = 0,
+) -> DocumentLink:
+    """Связать два документа проекта между собой (ТЗ п.87).
+
+    Итоговый акт ссылается на акты, которые он завершает: без этой связи
+    нельзя проверить, что дата окончания АООК не раньше окончания связанного
+    АОСР. Файлы при этом не копируются — связь логическая (ТЗ п.47, 48, 49).
+    """
+    document = db.get(Document, document_id)
+    if document is None:
+        raise MaterialError(f"Документ не найден: {document_id}")
+    related = db.get(Document, related_document_id)
+    if related is None:
+        raise MaterialError(f"Связываемый документ не найден: {related_document_id}")
+    if link_role not in domain.DOCUMENT_LINK_ROLES:
+        raise MaterialError(f"Неизвестная роль связи документов: {link_role}")
+    if document_id == related_document_id:
+        raise MaterialError(
+            "Документ нельзя связать с самим собой (ТЗ п.87)."
+        )
+    if related.project_id != document.project_id:
+        raise MaterialError(
+            "Связывать документы разных проектов нельзя (ТЗ п.49)."
+        )
+    _check_finalizes_pair(document, related, link_role)
+
+    link = DocumentLink(
+        document_id=document_id,
+        related_document_id=related_document_id,
+        link_role=link_role,
+        order_no=order_no,
+    )
+    db.add(link)
+    try:
+        db.flush()
+        record_event(
+            db, document.project_id, domain.HISTORY_LINK_ADDED,
+            f"{document.type_label} № {document.number} завершает "
+            f"{related.type_label} № {related.number} (ТЗ п.87)",
+            entity_type="document", entity_id=document.id,
+            payload={
+                "link_role": link_role,
+                "related_document_id": related.id,
+                "related_number": related.number,
+                "link_id": link.id,
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise MaterialError(
+            f"Связь {document.type_label} № {document.number} с "
+            f"{related.type_label} № {related.number} уже есть. Повторная связь "
+            "не создаётся (ТЗ п.87)."
+        ) from exc
+    db.refresh(link)
+    return link
+
+
+def _check_finalizes_pair(document: Document, related: Document, link_role: str) -> None:
+    """Итоговый акт завершает только акты скрытых работ (ТЗ п.87).
+
+    Обратное направление не имеет смысла по ТЗ: срок работы сравнивают с
+    актами, а не наоборот, поэтому такая связь отвергается сразу, а не
+    обнаруживается при выгрузке.
+    """
+    if link_role != domain.LINK_ROLE_FINALIZES:
+        return
+    if document.doc_type == domain.DOC_TYPE_AOSR:
+        raise MaterialError(
+            "Акту скрытых работ нельзя объявить завершающим: роль «"
+            f"{domain.LINK_ROLE_FINALIZES}» указывается у итогового акта "
+            "(ТЗ п.87)."
+        )
+    if related.doc_type != domain.DOC_TYPE_AOSR:
+        raise MaterialError(
+            f"{document.type_label} может завершать только акты освидетельствования "
+            f"скрытых работ, а указан {related.type_label} (ТЗ п.87)."
+        )
+
+
+def unlink_documents(db: Session, link_id: int) -> None:
+    """Удалить связь документов, сами документы сохраняются (ТЗ п.52, 87)."""
+    link = db.get(DocumentLink, link_id)
+    if link is None:
+        raise MaterialError(f"Связь не найдена: {link_id}")
+    document = link.document
+    related = link.related_document
+    message = (
+        f"{document.type_label} № {document.number}: связь с "
+        f"{related.type_label} № {related.number} удалена (ТЗ п.87)"
+    )
+    db.delete(link)
+    db.flush()
+    record_event(
+        db, document.project_id, domain.HISTORY_LINK_REMOVED, message,
+        entity_type="document", entity_id=document.id,
+        payload={
+            "link_role": link.link_role,
+            "related_document_id": related.id,
+            "related_number": related.number,
+        },
+    )
+    db.commit()
+
+
+def list_document_relations(
+    db: Session, document_id: int
+) -> list[DocumentLink]:
+    """Связи документа с другими документами (ТЗ п.87)."""
+    return list(
+        db.scalars(
+            select(DocumentLink)
+            .where(DocumentLink.document_id == document_id)
+            .order_by(DocumentLink.link_role, DocumentLink.order_no)
+        ).all()
+    )
+
+
+def finalized_acts(db: Session, document_id: int) -> list[Document]:
+    """Акты, завершённые итоговым документом (ТЗ п.87)."""
+    return [link.related_document for link in list_document_relations(db, document_id)]
+
+
+def final_acts_of(db: Session, document_id: int) -> list[Document]:
+    """Итоговые акты, завершающие указанный акт (ТЗ п.87)."""
+    return list(
+        db.scalars(
+            select(Document)
+            .join(
+                DocumentLink,
+                DocumentLink.document_id == Document.id,
+            )
+            .where(DocumentLink.related_document_id == document_id)
+            .order_by(Document.number)
+        ).all()
+    )
+
+
+def project_acts_to_finalize(
+    db: Session, project_id: int, doc_type: str
+) -> list[Document]:
+    """Акты проекта, которые оператор может указать как завершаемые.
+
+    Уже связанные акты не предлагаются повторно (ТЗ п.87).
+    """
+    query = select(Document).where(
+        Document.project_id == project_id, Document.doc_type == doc_type
+    )
+    order = Document.doc_date.is_(None), Document.number
+    return list(db.scalars(query.order_by(*order)).all())

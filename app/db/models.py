@@ -426,6 +426,13 @@ class Document(Base):
     archive_links = relationship(
         "DocumentArchiveLink", back_populates="document", cascade="all, delete-orphan"
     )
+    # Связи с другими документами (ТЗ п.87).
+    document_links = relationship(
+        "DocumentLink", back_populates="document",
+        foreign_keys="DocumentLink.document_id",
+        cascade="all, delete-orphan",
+        order_by="DocumentLink.order_no",
+    )
     signature_blocks = relationship(
         "SignatureBlock", back_populates="document", cascade="all, delete-orphan"
     )
@@ -656,6 +663,48 @@ class DocumentArchiveLink(Base):
 
     def __repr__(self):
         return f"<Link {self.link_role} -> {self.archive_document_id}>"
+
+
+class DocumentLink(Base):
+    """Логическая связь между документами проекта. ТЗ п.43, 87, 88, 89.
+
+    Связь документов с архивом хранится в DocumentArchiveLink, а здесь
+    хранится связь документов друг с другом: итоговый акт ссылается на те
+    акты, которые он завершает. Без неё нельзя проверить логику дат
+    (ТЗ п.87): дата окончания АООК не может быть раньше окончания связанного
+    АОСР, а начало АООК не может быть позже начала связанного АОСР.
+    """
+
+    __tablename__ = 'document_links'
+    __table_args__ = (
+        UniqueConstraint(
+            'document_id', 'related_document_id', 'link_role',
+            name='uq_doc_doc_role',
+        ),
+        Index('ix_document_links_document', 'document_id', 'link_role'),
+        # Обратный поиск: какие итоговые акты закрывают данный акт.
+        Index('ix_document_links_related', 'related_document_id', 'link_role'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    document_id = Column(
+        Integer, ForeignKey('documents.id', ondelete="CASCADE"), nullable=False
+    )
+    related_document_id = Column(
+        Integer, ForeignKey('documents.id', ondelete="CASCADE"), nullable=False
+    )
+    link_role = Column(String, nullable=False)
+    order_no = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    document = relationship(
+        "Document", back_populates="document_links",
+        foreign_keys=[document_id],
+    )
+    related_document = relationship("Document", foreign_keys=[related_document_id])
+
+    def __repr__(self):
+        return f"<DocumentLink {self.link_role} {self.document_id}->{self.related_document_id}>"
 
 
 # =====================================================================

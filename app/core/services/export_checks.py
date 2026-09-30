@@ -18,7 +18,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core import domain
+from app.core import domain, validators
 from app.core.services import document_service, form_service
 from app.db.models import (
     ArchiveFileVersion, Document, DocumentArchiveLink, DocumentVersion,
@@ -129,7 +129,7 @@ def check_package(
     problems += _check_documents(project, documents)
     problems += _check_versions(db, documents)
     problems += _check_numbers(db, project_id, documents)
-    problems += _check_dates(documents)
+    problems += _check_dates(db, documents)
     problems += _check_links(db, documents)
     problems += _check_files(db, documents)
     problems += _check_attachments(db, documents)
@@ -219,21 +219,30 @@ def _check_numbers(
     return problems
 
 
-def _check_dates(documents: list[Document]) -> list[CheckProblem]:
-    """Даты документов (ТЗ п.43, 87)."""
+def _check_dates(db: Session, documents: list[Document]) -> list[CheckProblem]:
+    """Даты документов и логические зависимости дат (ТЗ п.43, 87).
+
+    Проверяется и дата документа, и срок работ: дата окончания АООК не
+    может быть раньше окончания связанного АОСР, а начало АООК — позже его
+    начала. Система проверяет, но не меняет даты (ТЗ п.43).
+    """
     problems = []
     for document in documents:
         if document.doc_date is None:
             problems.append(CheckProblem(
                 CHECK_DATES, _label(document), "Не задана дата документа.",
             ))
-            continue
-        try:
-            document_service.validate_document_date(document.doc_date)
-        except document_service.DocumentNumberError as exc:
-            problems.append(CheckProblem(
-                CHECK_DATES, _label(document), str(exc),
-            ))
+        else:
+            try:
+                document_service.validate_document_date(document.doc_date)
+            except document_service.DocumentNumberError as exc:
+                problems.append(CheckProblem(
+                    CHECK_DATES, _label(document), str(exc),
+                ))
+        problems.extend(
+            CheckProblem(CHECK_DATES, _label(document), text)
+            for text in validators.check_document_dates(db, document)
+        )
     return problems
 
 

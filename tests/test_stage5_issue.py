@@ -27,6 +27,9 @@ def _complete_payload(**extra) -> dict:
         "work_description": "Армирование стен, 120 м²",
         "section_refs": "КЖ",
         "work_period": "с 01.04.2024 по 30.04.2024",
+        # ТЗ п.43, 87: срок работ двумя датами для проверки зависимостей.
+        "period_start": "01.04.2024",
+        "period_end": "30.04.2024",
         "work_volume": "120 м² бетона Б25",
         "has_defects": "Нет",
         "conclusion": "Работы выполнены в полном объёме",

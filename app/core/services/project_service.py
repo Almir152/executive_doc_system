@@ -76,6 +76,18 @@ def delete_project(db: Session, project_id: int) -> None:
             "вместе с проектом."
         )
 
+    # Черновики — рабочие данные, а не история (ТЗ п.66): внешний ключ
+    # версий на документ объявлен RESTRICT ради выпусков, поэтому незакрытые
+    # черновики снимаются явно. Иначе оператор получал бы ошибку БД вместо
+    # понятного отказа или успешного удаления.
+    drafts = db.scalars(
+        select(DocumentVersion)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(Document.project_id == project_id, DocumentVersion.issued_at.is_(None))
+    ).all()
+    for draft in drafts:
+        db.delete(draft)
+
     db.delete(project)
     db.commit()
 

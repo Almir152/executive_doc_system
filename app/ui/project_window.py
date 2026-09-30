@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app import settings
-from app.core import domain
+from app.core import domain, validators
 from app.core.services import document_service, form_service, issue_service
 from app.core.services import link_service, package_service, printing
 from app.core.services import project_service as service
@@ -444,6 +444,25 @@ class ProjectWindow(QWidget):
         link_buttons.addStretch()
         links_layout.addLayout(link_buttons)
 
+        # ТЗ п.87: итоговый акт ссылается на акты, которые он завершает.
+        # По этой связи проверяются логические зависимости дат.
+        self.btn_finalize = QPushButton("+ Акты, которые завершает документ")
+        self.btn_finalize.clicked.connect(self.add_finalized_acts)
+        link_buttons.addWidget(self.btn_finalize)
+        self.btn_unfinalize = QPushButton("Убрать связь актов")
+        self.btn_unfinalize.setStyleSheet("background-color: #ffdddd; color: #990000;")
+        self.btn_unfinalize.clicked.connect(self.delete_finalized_act)
+        link_buttons.addWidget(self.btn_unfinalize)
+
+        self.finalized_table = QTableWidget(0, 3)
+        self.finalized_table.setHorizontalHeaderLabels(
+            ["АОСР", "Период работ", "Проверка дат"]
+        )
+        self.finalized_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        links_layout.addWidget(self.finalized_table)
+
         self.links_table = QTableWidget(0, 4)
         self.links_table.setHorizontalHeaderLabels(
             ["Файл", "Категория", "Роль", "Версия"]
@@ -816,10 +835,12 @@ class ProjectWindow(QWidget):
         document = self._selected_document_quiet()
         if document is None:
             self.links_table.setRowCount(0)
+            self.finalized_table.setRowCount(0)
             self.links_hint.setText(
                 "Связи показываются для документа, выбранного в перечне выше."
             )
             return
+        self._reload_finalized_acts(document)
         links = link_service.list_document_links(self.db, document.id)
         self.links_hint.setText(
             f"Связи документа "
@@ -861,19 +882,13 @@ class ProjectWindow(QWidget):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            link = link_service.link_document_to_archive(
+            link_service.link_document_to_archive(
                 self.db, document_id=document.id, **dialog.values()
             )
         except link_service.MaterialError as exc:
             QMessageBox.warning(self, "Связь не создана", str(exc))
             return
-        service.record_event(
-            self.db, self.project_id, "document_linked",
-            f"К документу № {document.number} привязан файл "
-            f"{link.archive_document.original_name if link.archive_document else '—'}",
-            entity_type="document", entity_id=document.id,
-        )
-        self.db.commit()
+        # Событие связи пишет сервис в своей транзакции (ТЗ п.86).
         self._reload_links()
         self._load_summary(service.get_project(self.db, self.project_id))
 
@@ -899,6 +914,94 @@ class ProjectWindow(QWidget):
         if answer != QMessageBox.StandardButton.Yes:
             return
         link_service.unlink_document_from_archive(self.db, link.id)
+        self._reload_links()
+        self._load_summary(service.get_project(self.db, self.project_id))
+
+    def _reload_finalized_acts(self, document) -> None:
+        """Показать завершаемые акты и результат проверки дат (ТЗ п.87)."""
+        relations = link_service.list_document_relations(self.db, document.id)
+        problems = validators.check_document_dates(self.db, document)
+        self.finalized_table.setRowCount(len(relations))
+        for row, link in enumerate(relations):
+            related = link.related_document
+            start, end = validators.document_period(self.db, related)
+            period = (
+                f"{validators.format_date(start)} — {validators.format_date(end)}"
+                if start or end else "срок не задан (ТЗ п.43)"
+            )
+            state = "не задан"
+            if start and end:
+                state = (
+                    "есть нарушение"
+                    if any(
+                        f"АОСР № {related.number}" in text or "окончания" in text
+                        for text in problems
+                    ) else "порядок дат соблюдён"
+                )
+            for column, value in enumerate(
+                (f"АОСР № {related.number}", period, state)
+            ):
+                self.finalized_table.setItem(row, column, QTableWidgetItem(value))
+        if problems:
+            self.finalized_table.setToolTip("; ".join(problems))
+        else:
+            self.finalized_table.setToolTip(
+                "Логические зависимости дат не нарушены (ТЗ п.87)."
+            )
+
+    def add_finalized_acts(self) -> None:
+        """Указать, какие АОСР завершает выбранный документ (ТЗ п.87)."""
+        from app.ui.document_link_dialog import DocumentLinkDialog
+
+        document = self._selected_document()
+        if document is None:
+            return
+        dialog = DocumentLinkDialog(self.db, self.project_id, document, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        created = 0
+        for related_id in dialog.selected_acts():
+            try:
+                link_service.link_documents(
+                    self.db, related_document_id=related_id, **values
+                )
+            except link_service.MaterialError as exc:
+                QMessageBox.warning(self, "Связь не создана", str(exc))
+                return
+            created += 1
+        self._reload_links()
+        self._load_summary(service.get_project(self.db, self.project_id))
+        if created:
+            QMessageBox.information(
+                self, "Связи созданы",
+                f"Указано завершаемых актов: {created}. Проверка дат "
+                "выполнена (ТЗ п.87).",
+            )
+
+    def delete_finalized_act(self) -> None:
+        """Убрать связь «итоговый акт завершает АОСР» (ТЗ п.87)."""
+        document = self._selected_document_quiet()
+        row = self.finalized_table.currentRow()
+        if document is None or row < 0:
+            QMessageBox.information(
+                self, "Выберите связь",
+                "Сначала выберите документ и акт в списке завершаемых.",
+            )
+            return
+        relations = link_service.list_document_relations(self.db, document.id)
+        if row >= len(relations):
+            return
+        link = relations[row]
+        answer = QMessageBox.question(
+            self, "Удаление связи",
+            f"Убрать связь с АОСР № {link.related_document.number}? "
+            "Проверка дат будет выполнена без него (ТЗ п.87).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        link_service.unlink_documents(self.db, link.id)
         self._reload_links()
         self._load_summary(service.get_project(self.db, self.project_id))
 
@@ -1008,13 +1111,9 @@ class ProjectWindow(QWidget):
         except document_service.DocumentNumberError as exc:
             QMessageBox.warning(self, "Документ не создан", str(exc))
             return
-        service.record_event(
-            self.db, self.project_id, "document_created",
-            f"Создан документ {domain.DOC_TYPE_LABELS[document.doc_type]} "
-            f"№ {document.number}",
-            entity_type="document", entity_id=document.id,
-        )
-        self.db.commit()
+        # Событие «документ создан» пишет сам сервис в своей транзакции
+        # (ТЗ п.86): иначе создание из другого окна осталось бы в истории
+        # незаметным.
         self.reload()
         self._select_document(document.id)
 

@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.config import ARCHIVE_DIR
 from app.core import domain
+from app.core.services.project_service import record_event
 from app.db.models import ArchiveDocument, ArchiveFileVersion
 
 # ТЗ п.50: архив делится логически на четыре части. Перечень берётся из ТЗ.
@@ -164,6 +165,17 @@ def add_file_to_archive(
         is_actual=True,
     )
     db.add(version)
+    db.flush()
+    record_event(
+        db, project_id, domain.HISTORY_ARCHIVE_FILE_ADDED,
+        f"В архив добавлен документ «{src_path.name}» "
+        f"(категория: {category}) (ТЗ п.86)",
+        entity_type="archive_document", entity_id=document.id,
+        payload={
+            "category": category, "original_name": src_path.name,
+            "file_hash": file_hash, "version_no": 1,
+        },
+    )
     db.commit()
     db.refresh(document)
     return document
@@ -269,7 +281,28 @@ def set_quality_details(
     document = get_archive_document(db, archive_document_id)
     if document is None:
         raise StorageError(f"Архивный документ не найден: {archive_document_id}")
+    before = (
+        document.validity_from, document.validity_to, document.note,
+    )
     _apply_quality_details(db, document, quality_type, validity_from, validity_to)
+    if (document.validity_from, document.validity_to, document.note) == before:
+        return document
+    db.flush()
+    record_event(
+        db, document.project_id, domain.HISTORY_ARCHIVE_QUALITY_SET,
+        f"Документ архива «{document.original_name}»: уточнены реквизиты "
+        f"качества и срок действия (ТЗ п.45, 46, 86)",
+        entity_type="archive_document", entity_id=document.id,
+        payload={
+            "quality_type": quality_type,
+            "validity_from": (
+                document.validity_from.isoformat() if document.validity_from else None
+            ),
+            "validity_to": (
+                document.validity_to.isoformat() if document.validity_to else None
+            ),
+        },
+    )
     db.commit()
     db.refresh(document)
     return document
@@ -348,6 +381,17 @@ def add_version(db: Session, archive_document_id: int, src_path: Path) -> Archiv
         is_actual=True,
     )
     db.add(version)
+    db.flush()
+    record_event(
+        db, document.project_id, domain.HISTORY_ARCHIVE_VERSION_ADDED,
+        f"Документ архива «{document.original_name}»: новая редакция "
+        f"{version.version_no} (ТЗ п.86, 93)",
+        entity_type="archive_document", entity_id=document.id,
+        payload={
+            "version_no": version.version_no, "file_hash": file_hash,
+            "original_name": document.original_name,
+        },
+    )
     db.commit()
     db.refresh(version)
     return version

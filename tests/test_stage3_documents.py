@@ -323,7 +323,9 @@ def test_project_window_document_creation_is_recorded(db, project, qapp, monkeyp
     window.add_document()
 
     events = project_service.list_events(db, project.id)
-    assert [e.event_type for e in events] == ["document_created"]
+    assert [e.event_type for e in events] == ["document_created"], (
+        "событие создания пишется один раз, сервисом (ТЗ п.86)"
+    )
     assert "АООК № 1" in events[0].message
     window.close()
 
@@ -429,6 +431,7 @@ def test_project_window_tree_counts_match_data(db, project, qapp):
     project_service.record_event(db, project.id, "project_created", "Проект создан")
     project_service.record_event(db, project.id, "project_created", "Проект создан")
     db.commit()
+    # Создание документа тоже событие истории (ТЗ п.86), поэтому их три.
 
     window = ProjectWindow(db, project.id)
     window.show()
@@ -437,7 +440,7 @@ def test_project_window_tree_counts_match_data(db, project, qapp):
         tree.topLevelItem(i).text(0): tree.topLevelItem(i).text(1)
         for i in range(tree.topLevelItemCount())
     }
-    assert values["История"] == "2"
+    assert values["История"] == "3"
     assert values["Комплекты"] == "0"
     assert values["Связанные документы"] == "0"
     window.close()

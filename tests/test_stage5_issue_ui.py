@@ -14,6 +14,7 @@ from app.ui.project_window import IssueDialog, ProjectWindow
 
 REQUIRED = (
     "object_name", "address", "work_description", "work_period",
+    "period_start", "period_end",
     "work_volume", "has_defects", "conclusion", "work_performer",
 )
 

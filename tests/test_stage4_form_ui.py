@@ -51,8 +51,8 @@ def _set_field(panel, key, value):
 def _fill_required(panel, sections=("КЖ",)):
     for key in (
         "object_name", "address", "work_description",
-        "work_period", "work_volume", "has_defects", "conclusion",
-        "work_performer",
+        "work_period", "period_start", "period_end",
+        "work_volume", "has_defects", "conclusion", "work_performer",
     ):
         _set_field(panel, key, "значение")
     for code in sections:

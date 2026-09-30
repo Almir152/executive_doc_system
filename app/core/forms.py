@@ -64,6 +64,13 @@ FIELD_SOURCES = frozenset({
     SOURCE_DOCUMENT, SOURCE_LINKED, SOURCE_SECTION,
 })
 
+# Тип значения поля. Дата вводится оператором в формате дд.мм.гггг и
+# хранится текстом: системе нельзя менять дату самостоятельно (ТЗ п.43).
+FIELD_TYPE_TEXT = "text"
+FIELD_TYPE_NUMBER = "number"
+FIELD_TYPE_DATE = "date"
+FIELD_TYPES = (FIELD_TYPE_TEXT, FIELD_TYPE_NUMBER, FIELD_TYPE_DATE)
+
 # --------------------------------------------------------------------------
 # Параметры печати (ТЗ п.55-61)
 # --------------------------------------------------------------------------
@@ -175,6 +182,8 @@ class FormField:
     # ТЗ п.64: незаполненный блок представителя эксплуатации можно убрать
     # из печатной формы, если это допускает конкретная форма (п.40).
     omittable_if_empty: bool = False
+    # Тип значения: текст, число или дата (ТЗ п.43, 87).
+    value_type: str = FIELD_TYPE_TEXT
 
     @classmethod
     def from_dict(cls, data: dict) -> "FormField":
@@ -185,6 +194,9 @@ class FormField:
         if "choices" in data:
             data = dict(data)
             data["ordered_choices"] = tuple(data.pop("choices"))
+        if "type" in data:
+            data = dict(data)
+            data["value_type"] = data.pop("type")
         known = set(cls.__dataclass_fields__)
         unknown = set(data) - known
         if unknown:
@@ -197,6 +209,11 @@ class FormField:
         if data.get("source", SOURCE_MANUAL) not in FIELD_SOURCES:
             raise FormDefinitionError(
                 f"неизвестный источник значения {data['source']!r}"
+            )
+        if data.get("value_type", FIELD_TYPE_TEXT) not in FIELD_TYPES:
+            raise FormDefinitionError(
+                f"неизвестный тип значения поля {data.get('value_type')!r} "
+                f"у {data.get('key')!r}; допустимо: {', '.join(FIELD_TYPES)}"
             )
         if kind == BLOCK_FIXED_TEXT and not data.get("text"):
             raise FormDefinitionError(
@@ -375,6 +392,8 @@ def _field_to_dict(field_def: "FormField") -> dict:
         data["source"] = field_def.source
     if field_def.required:
         data["required"] = True
+    if field_def.value_type != FIELD_TYPE_TEXT:
+        data["type"] = field_def.value_type
     for name in ("role", "link_role", "note", "text"):
         value = getattr(field_def, name)
         if value:

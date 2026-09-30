@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import domain
+from app.core.services.project_service import record_event
 from app.db.models import Document, Project
 
 
@@ -129,12 +130,24 @@ def create_document(
     )
     db.add(document)
     try:
+        db.flush()
+        # ТЗ п.86: появление документа — событие истории проекта.
+        record_event(
+            db, project_id, domain.HISTORY_DOCUMENT_CREATED,
+            f"Создан документ {document.type_label} № {number} (ТЗ п.86)",
+            entity_type="document", entity_id=document.id,
+            payload={
+                "doc_type": doc_type, "number": number,
+                "doc_date": doc_date.isoformat() if doc_date else None,
+            },
+        )
         db.commit()
     except IntegrityError as exc:
         db.rollback()
         raise DocumentNumberError(
             f"Не удалось создать документ с номером «{number}»: номер уже занят."
         ) from exc
+    db.refresh(document)
     return document
 
 

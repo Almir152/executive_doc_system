@@ -22,7 +22,7 @@ from app.core import domain
 logger = logging.getLogger(__name__)
 
 # Текущая версия схемы. Увеличивать при добавлении миграции.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Справочники и формы, которые миграция создаёт сама, до переноса данных.
 # Миграция не должна зависеть от того, что create_all уже отработал.
@@ -635,6 +635,25 @@ def migration_004(conn) -> None:
     )
 
 
+def migration_005(conn) -> None:
+    """Связи между документами проекта. ТЗ п.43, 87, 89.
+
+    Добавлена таблица ``document_links``: итоговый акт ссылается на акты,
+    которые он завершает. Без этой связи нельзя проверить, что АООК не
+    заканчивается раньше связанного АОСР (ТЗ п.87).
+
+    Сроки работ хранятся в данных формы (``period_start`` / ``period_end``
+    в версии документа) — там же, где остальные поля формы, поэтому второго
+    места хранения не создаётся.
+
+    Существующие данные не меняются: новая таблица пуста.
+    """
+    from app.db.models import DocumentLink
+
+    create_table(conn, DocumentLink.__table__)
+    create_indexes(conn)
+
+
 # =====================================================================
 # Реестр миграций
 # =====================================================================
@@ -644,6 +663,7 @@ MIGRATIONS = [
     (2, "add_lookup_indexes", migration_002),
     (3, "protect_issued_document_versions", migration_003),
     (4, "restore_version_number_uniqueness", migration_004),
+    (5, "document_dates_and_links", migration_005),
 ]
 
 
