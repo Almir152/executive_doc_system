@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QMessageBox, QInputDialog, QStackedWidget, QFileDialog,
     QLineEdit, QFormLayout, QComboBox, QGroupBox
 )
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCloseEvent
 
 from app.config import ARCHIVE_DIR, DATA_DIR, PACKAGES_DIR, ensure_dirs
@@ -18,6 +19,10 @@ from app.core.services.storage_service import (
     calculate_hash, find_by_hash,
 )
 from app.core.services.exporter import export_package
+from app.ui.project_window import ProjectWindow
+from app.core.services.project_service import (
+    ProjectError, can_delete_project, delete_project,
+)
 
 
 class MainWindow(QMainWindow):
@@ -25,6 +30,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Единая система управления ИД")
         self.resize(1150, 750)
+        self.project_window = None
 
         # Легкая адаптация стиля (полезно для Windows)
         self.setStyleSheet("""
@@ -130,9 +136,24 @@ class MainWindow(QMainWindow):
         self.projects_table.setHorizontalHeaderLabels(["ID", "Направление", "Наименование", "Адрес"])
         self.projects_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.projects_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        # ТЗ п.16: рабочее окно проекта открывается из списка проектов.
+        self.projects_table.itemDoubleClicked.connect(self.open_project_window)
         layout.addWidget(self.projects_table)
 
         return page
+
+    def open_project_window(self):
+        """Открыть рабочее окно проекта (ТЗ п.16)."""
+        project_id = self.selected_project_id()
+        if project_id is None:
+            return
+        if self.project_window is not None:
+            self.project_window.close()
+        self.project_window = ProjectWindow(self.db, project_id, self)
+        self.project_window.show()
+        self.project_window.setAttribute(
+            Qt.WidgetAttribute.WA_DeleteOnClose, True
+        )
 
     def create_archive_page(self):
         page = QWidget()
@@ -494,29 +515,26 @@ class MainWindow(QMainWindow):
         if proj is None:
             return
 
-        # ТЗ п.86, 109: проект — корень истории. Удаление необратимо,
-        # поэтому требуем явного подтверждения оператора.
-        doc_count = self.db.query(Document).filter(Document.project_id == project_id).count()
-        archive_count = (
-            self.db.query(ArchiveDocument)
-            .filter(ArchiveDocument.project_id == project_id)
-            .count()
-        )
-        if archive_count:
-            # Архивные файлы — доказательства; каскадного удаления нет.
+        # Правила удаления живут в сервисе, а не здесь. Дублирование логики
+        # в окне привело к тому, что защита от потери выпусков и архива
+        # работала на сервисном пути, а оператор удалял проект из интерфейса
+        # мимо неё и получал необработанную ошибку (ТЗ п.97).
+        allowed, stats = can_delete_project(self.db, project_id)
+        if not allowed:
             QMessageBox.warning(
-                self, "Удаление невозможно",
-                f"В проекте {archive_count} архивных документов.\n"
-                "Сначала очистите архив проекта — файлы не удаляются "
-                "автоматически вместе с проектом.",
+                self,
+                "Удаление невозможно",
+                self._deletion_blocked_reason(stats),
             )
             return
 
+        # ТЗ п.86, 109: проект — корень истории. Удаление необратимо,
+        # поэтому требуем явного подтверждения оператора.
         answer = QMessageBox.question(
             self,
             "Удаление проекта",
             f"Удалить проект «{proj.title}»?\n"
-            f"Вместе с ним будет удалено документов: {doc_count}.\n"
+            f"Вместе с ним будет удалено документов: {stats['documents']}.\n"
             "Действие необратимо.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -524,9 +542,28 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        self.db.delete(proj)
-        self.db.commit()
+        try:
+            delete_project(self.db, project_id)
+        except ProjectError as exc:
+            # Правило могло сработать между проверкой и удалением.
+            QMessageBox.warning(self, "Удаление невозможно", str(exc))
+            return
         self.load_projects()
+
+    @staticmethod
+    def _deletion_blocked_reason(stats: dict) -> str:
+        """Причина отказа словами оператора, а не именами полей."""
+        if stats.get("archive_documents"):
+            return (
+                f"В проекте {stats['archive_documents']} архивных документов.\n"
+                "Сначала очистите архив проекта — файлы не удаляются "
+                "автоматически вместе с проектом."
+            )
+        return (
+            f"В проекте {stats['issued_versions']} выпущенных версий документов.\n"
+            "Выпуск — исторический результат (ТЗ п.54, 85) и не удаляется "
+            "вместе с проектом."
+        )
 
     def export_project_pdf(self):
         project_id = self.selected_project_id()

@@ -325,3 +325,43 @@ def test_gui_navigation_switches_all_pages(db):
         window.nav_list.setCurrentRow(row)
         assert "Рабочая область:" in window.title_label.text()
     window.close()
+
+
+@pytest.mark.gui
+def test_gui_delete_project_reports_issued_versions_instead_of_crashing(
+    db, project, gui_support
+):
+    """Удаление проекта с выпусками должно объяснять отказ, а не падать.
+
+    Защита от потери выпусков живёт в сервисе, а окно удаляет проект само,
+    минуя сервис. Такое расхождение означало, что оператор вместо внятного
+    сообщения получал необработанную ошибку Qt — по ТЗ п.97 сбой должен быть
+    виден и объяснён.
+    """
+    from app.config import utcnow
+    from app.db.models import Document, DocumentVersion
+    from app.ui.main_window import MainWindow
+
+    document = Document(project_id=project.id, doc_type="АОСР", number="12")
+    db.add(document)
+    db.commit()
+    db.add(
+        DocumentVersion(
+            document_id=document.id, version_no=1,
+            payload={"номер": "12"}, issued_at=utcnow(), is_actual=True,
+        )
+    )
+    db.commit()
+
+    window = MainWindow()
+    window.show()
+    window.load_projects()
+    window.projects_table.selectRow(0)
+    window.delete_project()
+
+    assert gui_support["warning"], "оператор не получил объяснение отказа"
+    assert gui_support["critical"] == [], "ошибка упала необработанной"
+    text = gui_support["warning"][0][2]
+    assert "выпущенных версий" in text, f"в сообщении нет сути: {text!r}"
+    assert db.query(DocumentVersion).count() == 1, "выпуск потерян"
+    window.close()
