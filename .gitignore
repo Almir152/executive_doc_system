@@ -29,7 +29,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Папки сборки PyInstaller
+# Папки сборки PyInstaller. Сам файл описания сборки (ExecutiveDocSystem.spec)
+# в репозитории нужен: без него .exe нельзя собрать из свежего клона.
 build/
 dist/
 *.spec
+!ExecutiveDocSystem.spec
+
+# Окружение, создаваемое build_windows.bat
+buildenv/
