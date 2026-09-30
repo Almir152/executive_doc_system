@@ -6,7 +6,7 @@
 from datetime import date
 
 import pytest
-from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
 from app.core import domain
 from app.core.services import document_service, form_service, issue_service
@@ -213,3 +213,79 @@ def test_issue_dialog_keeps_entered_date(qapp, db, document):
             dialog.doc_date()
     finally:
         dialog.deleteLater()
+
+
+# =====================================================================
+# ПЕЧАТЬ ФОРМЫ (ТЗ п.55–62)
+# =====================================================================
+
+
+def test_print_button_requires_document_selection(qapp, db, project, shown):
+    window = ProjectWindow(db, project.id)
+
+    assert window.btn_print_form.isEnabled() is False
+    window.close()
+
+
+def test_print_button_enabled_for_selected_document(qapp, db, project, document, shown):
+    window = ProjectWindow(db, project.id)
+    window._select_document(document.id)
+
+    assert window.btn_print_form.isEnabled() is True
+    window.close()
+
+
+def test_print_creates_pdf(qapp, db, project, document, shown, monkeypatch, tmp_path):
+    form_service.save_draft(db, document.id, _complete())
+    target = tmp_path / "form.pdf"
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName",
+        classmethod(lambda cls, parent, title, name, filt: (str(target), filt)),
+    )
+    opened = []
+    monkeypatch.setattr("app.ui.project_window._open_pdf", lambda path, parent: opened.append(path))
+
+    window = ProjectWindow(db, project.id)
+    window._select_document(document.id)
+    window.print_form()
+
+    assert target.exists()
+    assert opened == [target]
+    assert any("сохранён" in text.lower() for _, text in shown)
+    window.close()
+
+
+def test_print_cancelled_keeps_no_file(qapp, db, project, document, shown, monkeypatch, tmp_path):
+    form_service.save_draft(db, document.id, _complete())
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName",
+        classmethod(lambda cls, parent, title, name, filt: ("", "")),
+    )
+
+    window = ProjectWindow(db, project.id)
+    window._select_document(document.id)
+    window.print_form()
+
+    assert list(tmp_path.glob("*.pdf")) == []
+    window.close()
+
+
+def test_print_error_is_reported(qapp, db, project, document, shown, monkeypatch, tmp_path):
+    """Ошибка печати показывается оператору, а не роняет приложение."""
+    from app.core.services import printing
+
+    form_service.save_draft(db, document.id, _complete())
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName",
+        classmethod(lambda cls, parent, title, name, filt: (str(tmp_path / "x.pdf"), "")),
+    )
+    def boom(*args, **kwargs):
+        raise printing.PrintError("Шрифт не найден (ТЗ п.59).")
+    monkeypatch.setattr(printing, "render_document_pdf", boom)
+
+    window = ProjectWindow(db, project.id)
+    window._select_document(document.id)
+    window.print_form()
+
+    assert any("Шрифт не найден" in text for _, text in shown)
+    window.close()

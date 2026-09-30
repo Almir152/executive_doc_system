@@ -128,6 +128,52 @@ LINK_ROLES = (
     LINK_ROLE_SURVEY,
 )
 
+# --- Раздел 30 / 47 / 48. Роли перечней в описаниях нормативных форм -----
+# Описание формы — данные, и в нём роль связи названа коротким
+# идентификатором («quality», «geodetic_scheme»), а в базе связь хранится с
+# доменной ролью («Документ качества», «Исполнительная схема»). Без явного
+# сопоставления перечень в печатной форме всегда был бы пустым: роль из
+# описания не совпала бы с ролью связи ни разу.
+FORM_LINK_ROLES = {
+    "material": (LINK_ROLE_MATERIAL,),
+    "quality": (LINK_ROLE_QUALITY,),
+    # п.30: результаты экспертиз, обследований, лабораторных и иных
+    # испытаний — это документы качества и обследования.
+    "quality_evidence": (LINK_ROLE_QUALITY, LINK_ROLE_SURVEY),
+    "protocol": (LINK_ROLE_PROTOCOL, LINK_ROLE_TEST_PROTOCOL),
+    "geodetic_scheme": (LINK_ROLE_SCHEME,),
+    # Принятые конструкции и работы: всё, кроме приложений (п.29).
+    "accepted_work": (
+        LINK_ROLE_MATERIAL,
+        LINK_ROLE_QUALITY,
+        LINK_ROLE_PROTOCOL,
+        LINK_ROLE_TEST_PROTOCOL,
+        LINK_ROLE_SURVEY,
+        LINK_ROLE_SCHEME,
+    ),
+    "attachment": (LINK_ROLE_ATTACHMENT,),
+}
+
+
+class UnknownLinkRole(Exception):
+    """В описании формы указана роль связи, которой нет в ТЗ."""
+
+
+def link_roles_for_form(identifier: str) -> tuple[str, ...]:
+    """Доменные роли связей для блока перечня документов формы.
+
+    Неизвестный идентификатор — ошибка данных, а не пустой результат: молча
+    показать пустой перечень значило бы скрыть от оператора документы,
+    которые он привязал (ТЗ п.30, 47).
+    """
+    roles = FORM_LINK_ROLES.get(identifier)
+    if not roles:
+        raise UnknownLinkRole(
+            f"В описании формы указана неизвестная роль связи: {identifier!r}. "
+            f"Известные роли: {', '.join(sorted(FORM_LINK_ROLES))}."
+        )
+    return roles
+
 # --- Раздел 40. Роли представителей --------------------------------------
 ROLE_EXPLOITATION = "Представитель эксплуатирующей организации"
 ROLE_PERFORMER = "Лицо, непосредственно выполнявшее работы"

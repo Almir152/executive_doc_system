@@ -5,12 +5,18 @@
 документов ещё нет (ТЗ п.16).
 """
 
+import os
+import re
+import subprocess
+import sys
 from datetime import date, datetime
+from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QFileDialog, QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox,
+    QPushButton,
     QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
     QWidget,
 )
@@ -18,7 +24,7 @@ from PyQt6.QtWidgets import (
 from app import settings
 from app.core import domain
 from app.core.services import document_service, form_service, issue_service
-from app.core.services import link_service
+from app.core.services import link_service, printing
 from app.core.services import project_service as service
 from app.db.models import (
     ArchiveDocument, Document, Organization, Package,
@@ -331,6 +337,11 @@ class ProjectWindow(QWidget):
         self.btn_new_revision.clicked.connect(self.start_revision)
         self.btn_new_revision.setEnabled(False)
         doc_buttons.addWidget(self.btn_new_revision)
+        # ТЗ п.55–62: печатная форма собирается по нормативному описанию.
+        self.btn_print_form = QPushButton("Печать формы")
+        self.btn_print_form.clicked.connect(self.print_form)
+        self.btn_print_form.setEnabled(False)
+        doc_buttons.addWidget(self.btn_print_form)
         doc_buttons.addStretch()
         documents_layout.addLayout(doc_buttons)
 
@@ -986,6 +997,34 @@ class ProjectWindow(QWidget):
         issued = document is not None and document.status == domain.DOC_STATUS_ISSUED
         self.btn_issue_document.setEnabled(document is not None and not issued)
         self.btn_new_revision.setEnabled(issued)
+        self.btn_print_form.setEnabled(document is not None)
+
+    def print_form(self) -> None:
+        """Напечатать форму документа в PDF по нормативному описанию (ТЗ п.55–62).
+
+        Открывается системный просмотрщик PDF: оператор печатает на принтере
+        теми настройками, которые приняты в его системе.
+        """
+        document = self._selected_document()
+        if document is None:
+            return
+        safe_number = re.sub(r"[^\w\-]+", "_", document.number or "б_номера")
+        suggested = Path.home() / f"{document.type_label}_{safe_number}.pdf"
+        target, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить печатную форму", str(suggested), "PDF (*.pdf)"
+        )
+        if not target:
+            return
+        try:
+            path = printing.render_document_pdf(self.db, document, target)
+        except (printing.PrintError, domain.UnknownLinkRole) as exc:
+            QMessageBox.warning(self, "Форма не напечатана", str(exc))
+            return
+        os.startfile(path) if sys.platform == "win32" else _open_pdf(path, self)
+        QMessageBox.information(
+            self, "Форма напечатана",
+            f"Файл сохранён: {path} (ТЗ п.55–62).",
+        )
 
     def issue_document(self) -> None:
         """Выпустить документ: зафиксировать версию (ТЗ п.85).
@@ -1177,6 +1216,24 @@ class ProjectWindow(QWidget):
             QMessageBox.warning(self, "Удаление невозможно", str(exc))
             return
         self._load_sections(service.get_project(self.db, self.project_id))
+
+
+def _open_pdf(path: Path, parent) -> None:
+    """Открыть PDF системным просмотрщиком (ТЗ п.55).
+
+    Ошибка открытия не должна выглядеть как ошибка печати: файл уже
+    сформирован, оператору нужно лишь знать, что просмотрщик не запустился.
+    """
+    for command in (["xdg-open"], ["open"], ["sensible-browser"]):
+        try:
+            subprocess.Popen(command + [str(path)])
+            return
+        except (FileNotFoundError, OSError):
+            continue
+    QMessageBox.information(
+        parent, "Файл сформирован",
+        f"PDF сохранён: {path}. Открыть его автоматически не удалось.",
+    )
 
 
 def _quantity_label(quantity: float | None) -> str:
