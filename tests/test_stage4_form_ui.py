@@ -329,6 +329,76 @@ def test_form_opens_in_project_window(qapp, db, project, document, monkeypatch):
     window.close()
 
 
+def test_form_opens_in_separate_window_when_mode_chosen(qapp, db, project, document):
+    """Согласованный режим открывает форму отдельно (ТЗ п.65)."""
+    from app import settings
+
+    settings.set_form_open_mode(settings.FORM_MODE_SEPARATE)
+    window = ProjectWindow(db, project.id)
+    window._select_document(document.id)
+
+    window.open_form()
+
+    assert window.form_panel is None, "в режиме «отдельно» панели в области нет"
+    assert window.separate_form_window is not None
+    assert window.separate_form_window.panel.document_id == document.id
+    window.close()
+
+
+def test_form_mode_is_kept_between_windows(qapp, db, project, document):
+    """Настройка режима сохраняется и применяется к следующему окну (ТЗ п.65)."""
+    from app import settings
+
+    settings.set_form_open_mode(settings.FORM_MODE_INSIDE)
+    window = ProjectWindow(db, project.id)
+    window._select_document(document.id)
+    window.form_mode_combo.setCurrentIndex(
+        window.form_mode_combo.findData(settings.FORM_MODE_SEPARATE)
+    )
+
+    assert settings.form_open_mode() == settings.FORM_MODE_SEPARATE
+    assert ProjectWindow(db, project.id).form_mode_combo.currentData() == (
+        settings.FORM_MODE_SEPARATE
+    )
+    settings.set_form_open_mode(settings.FORM_MODE_INSIDE)
+    window.close()
+
+
+def test_form_can_be_expanded_and_restored(qapp, db, project, document):
+    """Форма разворачивается и возвращается к прежнему размеру (ТЗ п.65)."""
+    window = ProjectWindow(db, project.id)
+    window._select_document(document.id)
+    window.show()
+    window.open_form()
+
+    assert window.sections_box.isVisible()
+    window.toggle_form_expanded()
+
+    assert not window.sections_box.isVisible(), "при развороте блоки должны скрыться"
+    assert window.btn_expand_form.text() == "Восстановить размер"
+
+    window.toggle_form_expanded()
+
+    assert window.sections_box.isVisible()
+    assert window.btn_expand_form.text() == "Развернуть форму"
+    window.close()
+
+
+def test_closing_form_restores_hidden_blocks(qapp, db, project, document):
+    """После закрытия развёрнутой формы блоки проекта возвращаются (ТЗ п.65)."""
+    window = ProjectWindow(db, project.id)
+    window._select_document(document.id)
+    window.show()
+    window.open_form()
+    window.toggle_form_expanded()
+
+    window.close_form()
+
+    assert window.sections_box.isVisible()
+    assert window.btn_expand_form.text() == "Развернуть форму"
+    window.close()
+
+
 def test_form_button_requires_document_selection(qapp, db, project, monkeypatch):
     """Без выбранного документа форма не открывается (ТЗ п.65)."""
     shown = []

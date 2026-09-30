@@ -90,6 +90,15 @@ def project(db, direction):
 
 
 @pytest.fixture(autouse=True)
+def clean_settings():
+    """Настройки приложения не должны переходить из теста в тест (ТЗ п.65)."""
+    from app.config import SETTINGS_PATH
+
+    yield
+    SETTINGS_PATH.unlink(missing_ok=True)
+
+
+@pytest.fixture(autouse=True)
 def qapp_env():
     """Заглушка на случай, если фикстуру попросят явно.
 

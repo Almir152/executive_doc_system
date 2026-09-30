@@ -5,9 +5,9 @@
 """
 
 from PyQt6.QtWidgets import (
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-    QRadioButton,
-    QPlainTextEdit, QPushButton, QScrollArea, QTextEdit, QVBoxLayout, QWidget,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 from app.core import domain
@@ -349,6 +349,23 @@ def _build_editor(field: dict, value):
     edit.setPlainText(str(value or ""))
     edit.setMaximumHeight(70)
     return edit
+
+
+class DocumentFormWindow(QMainWindow):
+    """Форма документа в отдельном окне (ТЗ п.65).
+
+    Тот же `DocumentFormPanel`, что и в рабочей области: режим открытия
+    меняет только место показа, а не состав полей и правила сохранения.
+    """
+
+    def __init__(self, db, document_id, project_id=None, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.document_id = document_id
+        self.setWindowTitle("Форма документа (ТЗ п.65)")
+        self.resize(900, 800)
+        self.panel = DocumentFormPanel(db, document_id, project_id=project_id)
+        self.setCentralWidget(self.panel)
 
 
 def _status_label(status: str | None) -> str:

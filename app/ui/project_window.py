@@ -15,13 +15,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app import settings
 from app.core import domain
 from app.core.services import document_service, form_service, link_service
 from app.core.services import project_service as service
 from app.db.models import (
     ArchiveDocument, Document, Organization, Package,
 )
-from app.ui.document_form import DocumentFormPanel
+from app.ui.document_form import DocumentFormPanel, DocumentFormWindow
 from app.ui.reference_picker import ReferenceMultiPicker, ReferencePicker
 from app.ui.section_dialog import SectionDialog, kind_options as db_kinds
 
@@ -247,8 +248,8 @@ class ProjectWindow(QWidget):
 
         # ТЗ п.16: виды документов показаны дерево; пустой вид создаётся сразу,
         # чтобы оператор мог начать работу до появления первого документа.
-        documents_box = QGroupBox("Документы проекта (ТЗ п.16, 42, 43)")
-        documents_layout = QVBoxLayout(documents_box)
+        self.documents_box = QGroupBox("Документы проекта (ТЗ п.16, 42, 43)")
+        documents_layout = QVBoxLayout(self.documents_box)
         doc_buttons = QHBoxLayout()
         self.btn_add_document = QPushButton("+ Документ")
         self.btn_add_document.clicked.connect(self.add_document)
@@ -286,14 +287,38 @@ class ProjectWindow(QWidget):
         )
         self.documents_hint.setWordWrap(True)
         documents_layout.addWidget(self.documents_hint)
-        layout.addWidget(documents_box)
+        layout.addWidget(self.documents_box)
 
         # Рабочая область формы документа (ТЗ п.65).
         self.form_container = QWidget()
         self.form_layout = QVBoxLayout(self.form_container)
         self.form_layout.setContentsMargins(0, 0, 0, 0)
         self.form_container.setVisible(False)
+
+        # ТЗ п.65: форму можно развернуть и вернуть к прежнему размеру, а
+        # режим открытия выбирается один раз для приложения.
+        form_tools = QHBoxLayout()
+        self.btn_expand_form = QPushButton("Развернуть форму")
+        self.btn_expand_form.clicked.connect(self.toggle_form_expanded)
+        form_tools.addWidget(self.btn_expand_form)
+        self.form_mode_combo = QComboBox()
+        for mode in settings.FORM_MODES:
+            self.form_mode_combo.addItem(settings.FORM_MODE_LABELS[mode], mode)
+        self.form_mode_combo.setCurrentIndex(
+            self.form_mode_combo.findData(settings.form_open_mode())
+        )
+        self.form_mode_combo.currentIndexChanged.connect(self._save_form_mode)
+        self.form_mode_combo.setToolTip(
+            "Режим открытия формы (ТЗ п.65): внутри рабочей области или отдельно."
+        )
+        form_tools.addWidget(QLabel("Открывать форму:"))
+        form_tools.addWidget(self.form_mode_combo)
+        form_tools.addStretch()
+        self.form_layout.addLayout(form_tools)
         layout.addWidget(self.form_container)
+        self._form_expanded = False
+        self._hidden_while_expanded: list[QWidget] = []
+        self.separate_form_window: DocumentFormWindow | None = None
 
         self.materials_box = QGroupBox(
             "Материалы (ТЗ п.44) и связи документов (ТЗ п.45, 47, 48)"
@@ -356,8 +381,8 @@ class ProjectWindow(QWidget):
         layout.addWidget(self.materials_box)
         layout.addWidget(self.links_box)
 
-        summary_box = QGroupBox("Связанные документы, комплекты и история")
-        summary_layout = QVBoxLayout(summary_box)
+        self.summary_box = QGroupBox("Связанные документы, комплекты и история")
+        summary_layout = QVBoxLayout(self.summary_box)
         self.summary_label = QLabel()
         self.summary_label.setWordWrap(True)
         summary_layout.addWidget(self.summary_label)
@@ -368,7 +393,7 @@ class ProjectWindow(QWidget):
             QHeaderView.ResizeMode.Stretch
         )
         summary_layout.addWidget(self.history_table)
-        layout.addWidget(summary_box)
+        layout.addWidget(self.summary_box)
 
     # -----------------------------------------------------------------
     # ДАННЫЕ
@@ -887,7 +912,11 @@ class ProjectWindow(QWidget):
     # ФОРМА ДОКУМЕНТА (ТЗ п.63, 64, 65, 66)
     # -----------------------------------------------------------------
     def open_form(self) -> None:
-        """Открыть форму выбранного документа в рабочей области (ТЗ п.65)."""
+        """Открыть форму выбранного документа (ТЗ п.65).
+
+        Режим открытия — внутри рабочей области или отдельно — выбирается
+        оператором один раз для приложения (ТЗ п.65).
+        """
         document = self._selected_document()
         if document is None:
             return
@@ -895,8 +924,11 @@ class ProjectWindow(QWidget):
             if not self._close_form_confirmed():
                 return
 
-        if self.form_panel is not None:
-            self.form_panel.deleteLater()
+        if settings.form_open_mode() == settings.FORM_MODE_SEPARATE:
+            self._open_form_separate(document)
+            return
+
+        self._destroy_form()
         self.form_panel = DocumentFormPanel(
             self.db, document.id, project_id=document.project_id
         )
@@ -904,13 +936,68 @@ class ProjectWindow(QWidget):
         self.form_container.setVisible(True)
         self.btn_close_form.setEnabled(True)
 
+    def _open_form_separate(self, document) -> None:
+        """Показать форму в отдельном окне (ТЗ п.65)."""
+        if self.separate_form_window is not None:
+            self.separate_form_window.close()
+            self.separate_form_window = None
+        window = DocumentFormWindow(
+            self.db, document.id, project_id=document.project_id
+        )
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        window.show()
+        self.separate_form_window = window
+
+    def _save_form_mode(self) -> None:
+        """Сохранить выбранный режим открытия формы (ТЗ п.65)."""
+        mode = self.form_mode_combo.currentData()
+        if mode:
+            settings.set_form_open_mode(mode)
+
+    def toggle_form_expanded(self) -> None:
+        """Развернуть форму или вернуть прежний размер (ТЗ п.65)."""
+        if self.form_panel is None and self.separate_form_window is None:
+            return
+        if self._form_expanded:
+            for widget in self._hidden_while_expanded:
+                widget.setVisible(True)
+            self._hidden_while_expanded = []
+            self._form_expanded = False
+            self.btn_expand_form.setText("Развернуть форму")
+        else:
+            self._hidden_while_expanded = [
+                widget
+                for widget in (
+                    self.sections_box, self.documents_box, self.materials_box,
+                    self.links_box, self.summary_box,
+                )
+                if widget.isVisible()
+            ]
+            for widget in self._hidden_while_expanded:
+                widget.setVisible(False)
+            self._form_expanded = True
+            self.btn_expand_form.setText("Восстановить размер")
+
+    def _destroy_form(self) -> None:
+        """Убрать панель формы, вернув скрытые при развороте блоки."""
+        if self.form_panel is not None:
+            self.form_panel.deleteLater()
+            self.form_panel = None
+        if self._form_expanded:
+            for widget in self._hidden_while_expanded:
+                widget.setVisible(True)
+            self._hidden_while_expanded = []
+            self._form_expanded = False
+            self.btn_expand_form.setText("Развернуть форму")
+
     def close_form(self) -> None:
         """Закрыть форму; незавершённый ввод предлагается сохранить (ТЗ п.66)."""
         if not self._close_form_confirmed():
             return
-        if self.form_panel is not None:
-            self.form_panel.deleteLater()
-            self.form_panel = None
+        if self.separate_form_window is not None:
+            self.separate_form_window.close()
+            self.separate_form_window = None
+        self._destroy_form()
         self.form_container.setVisible(False)
         self.btn_close_form.setEnabled(False)
 
