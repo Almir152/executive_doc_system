@@ -167,10 +167,15 @@ def test_gui_regression_window_starts_with_populated_archive(db, project, tmp_pa
 
     window = MainWindow()
     window.show()
+    # ТЗ п.90: архив показывается по выбранному проекту, без проекта он пуст.
+    assert window.archive_table.rowCount() == 0
+    window.load_projects()
+    window.projects_table.selectRow(0)
+    window.load_archive_files()
     assert window.archive_table.rowCount() == 1
     assert window.archive_table.item(0, 1).text() == domain.ARCHIVE_CATEGORY_SCHEMES
     assert window.archive_table.item(0, 2).text() == "_gui_fixture.pdf", "Имя файла должно быть видно оператору"
-    assert window.archive_table.item(0, 3).text() == "0", "ТЗ п.51: колонка счётчика связей"
+    assert window.archive_table.item(0, 5).text() == "0", "ТЗ п.51: колонка счётчика связей"
     window.close()
 
 
@@ -194,6 +199,19 @@ def test_gui_regression_upload_file_to_archive(db, project, monkeypatch, gui_sup
     picked = iter([str(src), str(src)])
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (next(picked), ""))
 
+    import app.ui.main_window as main_module
+
+    # ТЗ п.45, 46: реквизиты качества вводятся в отдельном окне; в тесте
+    # оператора играет заглушка с нужными значениями.
+    asked = []
+
+    def fake_dialog(db_arg, file_name, category, parent=None):
+        asked.append((file_name, category))
+        return {"category": category, "quality_type": None,
+                "validity_from": None, "validity_to": None, "number": None}
+
+    monkeypatch.setattr(main_module, "show_upload_dialog", fake_dialog)
+
     assert db.query(ArchiveDocument).count() == 0
     window.archive_category_combo.setCurrentText(domain.ARCHIVE_CATEGORY_SCHEMES)
     window.upload_to_archive()
@@ -206,6 +224,9 @@ def test_gui_regression_upload_file_to_archive(db, project, monkeypatch, gui_sup
     assert stored.exists()
     assert str(stored).startswith(str(window.archive_dir))
     assert not gui_support["critical"], "Загрузка не должна давать ошибку"
+    assert asked == [("_upload_fixture.pdf", domain.ARCHIVE_CATEGORY_SCHEMES)], (
+        "оператору показывается окно реквизитов документа качества (ТЗ п.45)"
+    )
 
     # Повторная загрузка того же файла — дедупликация (ТЗ п.92).
     window.upload_to_archive()

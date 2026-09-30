@@ -12,12 +12,14 @@ from PyQt6.QtGui import QCloseEvent
 from app.config import ARCHIVE_DIR, DATA_DIR, PACKAGES_DIR, ensure_dirs
 from app.core import domain
 from app.db.database import SessionLocal, init_db
-from app.db.models import ArchiveDocument, Direction, Project, Document
+from app.db.models import Direction, Project, Document
 from app.ai.connector import AIConnector, MODE_LABELS, MODE_ORDER
+from app.core.services import storage_service
 from app.core.services.storage_service import (
     ARCHIVE_CATEGORIES, ARCHIVE_CATEGORY_DEFAULT, StorageError, add_file_to_archive,
     calculate_hash, find_by_hash,
 )
+from app.ui.archive_dialog import show_upload_dialog
 from app.core.services import export_checks
 from app.core.services.export_checks import check_package
 from app.core.services.package_service import PackageError, create_package
@@ -182,9 +184,18 @@ class MainWindow(QMainWindow):
         layout.addLayout(cat_layout)
 
         # ТЗ п.51: для архивного документа отображается количество его связей.
-        self.archive_table = QTableWidget(0, 5)
+        # ТЗ п.44: поиск по архиву проекта по имени, номеру и виду.
+        self.archive_search_input = QLineEdit()
+        self.archive_search_input.setPlaceholderText(
+            "Поиск по архиву: имя, номер, вид документа качества"
+        )
+        self.archive_search_input.textChanged.connect(self.filter_archive_files)
+        layout.addWidget(self.archive_search_input)
+
+        self.archive_table = QTableWidget(0, 6)
         self.archive_table.setHorizontalHeaderLabels(
-            ["ID", "Категория", "Имя файла", "Связей", "SHA-256"]
+            ["ID", "Категория", "Имя файла", "Вид качества", "Срок действия",
+             "Связей"]
         )
         self.archive_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.archive_table)
@@ -382,19 +393,34 @@ class MainWindow(QMainWindow):
             self.projects_table.setItem(row, 2, QTableWidgetItem(p.title or ""))
             self.projects_table.setItem(row, 3, QTableWidgetItem(p.address or ""))
 
-    def load_archive_files(self):
+    def load_archive_files(self, search: str = ""):
+        """Показать архив проекта (ТЗ п.44, 51, 46)."""
+        project_id = self.selected_project_id()
         self.archive_table.setRowCount(0)
-        for f in self.db.query(ArchiveDocument).all():
+        if project_id is None:
+            return
+        for f in storage_service.search_archive_documents(
+            self.db, project_id, search=search
+        ):
             row = self.archive_table.rowCount()
             self.archive_table.insertRow(row)
             self.archive_table.setItem(row, 0, QTableWidgetItem(str(f.id)))
             self.archive_table.setItem(row, 1, QTableWidgetItem(f.category or ""))
             self.archive_table.setItem(row, 2, QTableWidgetItem(f.original_name or ""))
+            # Вид документа качества и срок действия вводятся оператором
+            # (ТЗ п.45, 46) и показываются рядом с именем файла.
+            quality_type = f.note.split("Вид документа качества: ")[-1] \
+                if f.note and "Вид документа качества: " in f.note else ""
+            self.archive_table.setItem(row, 3, QTableWidgetItem(quality_type))
+            self.archive_table.setItem(
+                row, 4, QTableWidgetItem(storage_service.quality_validity_text(f))
+            )
             # ТЗ п.51: счётчик связей архивного документа.
-            self.archive_table.setItem(row, 3, QTableWidgetItem(str(f.links_count)))
-            current = f.current_version
-            hash_text = (current.file_hash[:16] + "...") if current else ""
-            self.archive_table.setItem(row, 4, QTableWidgetItem(hash_text))
+            self.archive_table.setItem(row, 5, QTableWidgetItem(str(f.links_count)))
+
+    def filter_archive_files(self, text: str = ""):
+        """Поиск по архиву проекта (ТЗ п.44)."""
+        self.load_archive_files(text)
 
     def upload_to_archive(self):
         # Архивный документ принадлежит проекту (ТЗ п.89, 90), поэтому без
@@ -412,34 +438,60 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
+        source = Path(file_path)
         try:
-            file_hash = calculate_hash(Path(file_path))
+            file_hash = calculate_hash(source)
             existing = find_by_hash(self.db, file_hash)
-            if existing:
-                # ТЗ п.92: физическая копия не создаётся второй раз.
-                QMessageBox.information(
-                    self,
-                    "Дубликат",
-                    f"Такой файл уже есть в архиве (ID {existing.archive_document_id}, "
-                    f"связей: {existing.archive_document.links_count}).\n"
-                    f"Новая копия не создана — используйте существующий архивный документ.",
-                )
-                return
+        except StorageError as e:
+            QMessageBox.critical(self, "Ошибка загрузки", str(e))
+            return
 
-            category = self.archive_category_combo.currentText() or ARCHIVE_CATEGORY_DEFAULT
-            archive_doc = add_file_to_archive(self.db, Path(file_path), project_id, category)
-            self.load_archive_files()
+        if existing:
+            # ТЗ п.92: физическая копия не создаётся второй раз.
             QMessageBox.information(
-                self, "Успех",
-                f"Файл загружен в архив (ID {archive_doc.id}).\n"
-                f"Категория: {archive_doc.category}\n"
-                f"Версий: {len(archive_doc.versions)}\n"
-                f"Связей: {archive_doc.links_count}",
+                self, "Дубликат",
+                f"Такой файл уже есть в архиве (ID {existing.archive_document_id}, "
+                f"связей: {existing.archive_document.links_count}).\n"
+                f"Новая копия не создана — используйте существующий архивный документ.",
+            )
+            return
+
+        # ТЗ п.45, 46: вид документа качества и срок его действия вводит
+        # оператор; к актам документ качества прикрепляется отдельно.
+        category = self.archive_category_combo.currentText() or ARCHIVE_CATEGORY_DEFAULT
+        try:
+            details = show_upload_dialog(
+                self.db, source.name, category, parent=self
             )
         except StorageError as e:
             QMessageBox.critical(self, "Ошибка загрузки", str(e))
-        except Exception as e:
+            return
+        if details is None:
+            return
+
+        try:
+            archive_doc = add_file_to_archive(
+                self.db, source, project_id,
+                category=details["category"],
+                quality_type=details["quality_type"],
+                validity_from=details["validity_from"],
+                validity_to=details["validity_to"],
+                number=details["number"],
+            )
+        except StorageError as e:
             QMessageBox.critical(self, "Ошибка загрузки", str(e))
+            return
+
+        self.load_archive_files(self.archive_search_input.text())
+        text = f"Файл загружен в архив (ID {archive_doc.id}).\nКатегория: {archive_doc.category}"
+        validity = storage_service.quality_validity_text(archive_doc)
+        if validity:
+            text += f"\nСрок действия: {validity}"
+        QMessageBox.information(
+            self, "Успех",
+            f"{text}\nВерсий: {len(archive_doc.versions)}\n"
+            f"Связей: {archive_doc.links_count}",
+        )
 
     def load_norms(self):
         self.norms_table.setRowCount(0)

@@ -24,7 +24,8 @@ from app.db.models import ArchiveDocument, ArchiveFileVersion
 
 # ТЗ п.50: архив делится логически на четыре части. Перечень берётся из ТЗ.
 ARCHIVE_CATEGORIES = domain.ARCHIVE_CATEGORIES
-ARCHIVE_CATEGORY_DEFAULT = domain.ARCHIVE_CATEGORY_MATERIALS
+ARCHIVE_CATEGORY_MATERIALS = domain.ARCHIVE_CATEGORY_MATERIALS
+ARCHIVE_CATEGORY_DEFAULT = ARCHIVE_CATEGORY_MATERIALS
 
 
 class StorageError(Exception):
@@ -86,6 +87,12 @@ def add_file_to_archive(
     src_path: Path,
     project_id: int,
     category: str = ARCHIVE_CATEGORY_DEFAULT,
+    *,
+    quality_type: str | None = None,
+    validity_from=None,
+    validity_to=None,
+    number: str | None = None,
+    doc_date=None,
 ) -> ArchiveDocument:
     """Добавить файл в единый архив. Возвращает логический документ.
 
@@ -96,6 +103,12 @@ def add_file_to_archive(
     существующим: разные документы могут носить одинаковое имя файла. Новая
     редакция существующего документа создаётся явно, через add_version()
     (ТЗ п.53).
+
+    Вид документа качества и сроки его действия (ТЗ п.45, 46) относятся к
+    логическому документу и вводятся оператором. Документ качества указывается
+    здесь, а конкретные акты, к которым он относится, оператор выбирает
+    отдельно: автоматического прикрепления ко всем актам не происходит
+    (ТЗ п.45).
     """
     src_path = Path(src_path)
     if not src_path.is_file():
@@ -107,7 +120,22 @@ def add_file_to_archive(
 
     existing_version = find_by_hash(db, file_hash)
     if existing_version is not None:
-        return existing_version.archive_document
+        # Физический файл уже в архиве (ТЗ п.92). Новой копии не создаётся,
+        # но оператор уточняет реквизиты уже загруженного документа: номер,
+        # вид и сроки действия вводятся один раз (ТЗ п.45, 46).
+        document = existing_version.archive_document
+        if category is not None and document.project_id == project_id:
+            document.category = category
+        _apply_quality_details(db, document, quality_type, validity_from, validity_to)
+        if number is not None:
+            document.number = number or None
+        if doc_date is not None:
+            document.doc_date = doc_date
+        db.commit()
+        db.refresh(document)
+        return document
+
+    _check_quality_details(quality_type, validity_from, validity_to, category)
 
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     # Полный хэш в имени обеспечивает уникальность, исходное имя сохраняется,
@@ -121,7 +149,11 @@ def add_file_to_archive(
         category=category,
         file_type=file_type_from_name(src_path.name),
         original_name=src_path.name,
+        number=number or None,
+        doc_date=doc_date,
     )
+    _apply_quality_details(db, document, quality_type, validity_from, validity_to,
+                           validate=False)
     db.add(document)
     version = ArchiveFileVersion(
         archive_document=document,
@@ -135,6 +167,158 @@ def add_file_to_archive(
     db.commit()
     db.refresh(document)
     return document
+
+
+# =====================================================================
+# Документы качества: вид и сроки действия (ТЗ п.45, 46)
+# =====================================================================
+
+def check_quality_details(
+    quality_type: str | None,
+    validity_from,
+    validity_to,
+    category: str,
+) -> None:
+    """Публичная проверка реквизитов документа качества (ТЗ п.45, 46).
+
+    Вызывается интерфейсом до сохранения, чтобы оператор увидел понятную
+    причину отказа в том же окне, где вводились данные.
+    """
+    _check_quality_details(quality_type, validity_from, validity_to, category)
+
+
+def _check_quality_details(
+    quality_type: str | None,
+    validity_from,
+    validity_to,
+    category: str,
+) -> None:
+    """Проверить вид документа качества и сроки его действия (ТЗ п.45, 46).
+
+    Вид документа качества имеет смысл только в части «Материалы и
+    документы качества»: сертификат не становится исполнительной схемой.
+    Для сертификатов и деклараций сроки действия обязательны, иначе нельзя
+    понять, применим ли документ к работам.
+    """
+    if quality_type is None:
+        if validity_from is not None or validity_to is not None:
+            raise StorageError(
+                "Срок действия указывается вместе с видом документа качества "
+                "(ТЗ п.46)."
+            )
+        return
+    if quality_type not in domain.QUALITY_DOC_TYPES:
+        raise StorageError(
+            f"Неизвестный вид документа качества: {quality_type}. Допустимо: "
+            + ", ".join(domain.QUALITY_DOC_TYPES) + " (ТЗ п.45)."
+        )
+    if category != ARCHIVE_CATEGORY_MATERIALS:
+        raise StorageError(
+            "Вид документа качества указывается только для части «Материалы и "
+            "документы качества» (ТЗ п.45)."
+        )
+    if quality_type in domain.QUALITY_DOC_TYPES_WITH_VALIDITY:
+        if validity_from is None or validity_to is None:
+            raise StorageError(
+                f"Для документа качества «{quality_type}» обязательны дата "
+                "начала и дата окончания действия (ТЗ п.46)."
+            )
+        if validity_to < validity_from:
+            raise StorageError(
+                "Дата окончания действия раньше даты начала: проверьте срок "
+                "действия документа качества (ТЗ п.46)."
+            )
+
+
+def _apply_quality_details(
+    db: Session,
+    document: ArchiveDocument,
+    quality_type: str | None,
+    validity_from,
+    validity_to,
+    *,
+    validate: bool = True,
+) -> None:
+    """Записать вид документа качества и сроки его действия (ТЗ п.45, 46)."""
+    if validate:
+        _check_quality_details(quality_type, validity_from, validity_to, document.category)
+    if quality_type is not None:
+        document.note = (
+            f"Вид документа качества: {quality_type}"
+            if not document.note
+            else f"{document.note}\nВид документа качества: {quality_type}"
+        )
+    if validity_from is not None:
+        document.validity_from = validity_from
+    if validity_to is not None:
+        document.validity_to = validity_to
+
+
+def set_quality_details(
+    db: Session,
+    archive_document_id: int,
+    quality_type: str,
+    validity_from=None,
+    validity_to=None,
+) -> ArchiveDocument:
+    """Уточнить вид и сроки действия уже загруженного документа (ТЗ п.45, 46).
+
+    Копия файла при этом не меняется: правится только логическая карточка
+    документа качества.
+    """
+    document = get_archive_document(db, archive_document_id)
+    if document is None:
+        raise StorageError(f"Архивный документ не найден: {archive_document_id}")
+    _apply_quality_details(db, document, quality_type, validity_from, validity_to)
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+def search_archive_documents(
+    db: Session,
+    project_id: int,
+    *,
+    search: str = "",
+    category: str | None = None,
+    quality_type: str | None = None,
+) -> list[ArchiveDocument]:
+    """Поиск по архиву проекта (ТЗ п.44, 45).
+
+    Ищет по имени файла, номеру и виду документа качества. Пустые условия
+    не ограничивают выборку.
+    """
+    query = select(ArchiveDocument).where(ArchiveDocument.project_id == project_id)
+    if category:
+        query = query.where(ArchiveDocument.category == category)
+    if quality_type:
+        query = query.where(ArchiveDocument.note.like(f"%{quality_type}%"))
+    documents = list(db.scalars(query.order_by(ArchiveDocument.original_name)).all())
+    if not search:
+        return documents
+
+    # Сравнение в Python: `lower()` в SQLite не приводит регистр кириллицы,
+    # а поиск должен работать независимо от настроек базы (ТЗ п.44).
+    needle = search.strip().casefold()
+    found = []
+    for document in documents:
+        haystack = " ".join(
+            part for part in (
+                document.original_name, document.number, document.note,
+            ) if part
+        )
+        if needle in haystack.casefold():
+            found.append(document)
+    return found
+
+
+def quality_validity_text(document: ArchiveDocument) -> str:
+    """Срок действия документа качества для интерфейса (ТЗ п.46)."""
+    if document.validity_from is None and document.validity_to is None:
+        return ""
+    start = document.validity_from.strftime("%d.%m.%Y") if document.validity_from else "—"
+    end = document.validity_to.strftime("%d.%m.%Y") if document.validity_to else "—"
+    return f"действует {start} — {end}"
 
 
 def add_version(db: Session, archive_document_id: int, src_path: Path) -> ArchiveFileVersion:
