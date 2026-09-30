@@ -203,6 +203,57 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Запуск на Linux
+
+Приложение полноценно работает на Linux, но запускать его нужно в графической
+сессии: Qt требует работающего дисплейного сервера.
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+python main.py
+```
+
+Если окно не открывается и в выводе есть сообщение про `xcb`, не хватает
+системных библиотек Qt6:
+
+```bash
+sudo apt install libxkbcommon-x11-0 libxcb-cursor0 libxcb-xinerama0 \
+    libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+    libxcb-render-util0 libxcb-shape0 fonts-dejavu
+```
+
+Данные по умолчанию лежат в `storage/` рядом с `main.py`. Чтобы держать их в
+другом месте (например, на отдельном разделе), задайте переменную окружения
+`EXECUTIVE_DOC_DATA_DIR`.
+
+**Автономная сборка под Linux** (отдельный каталог, чтобы не смешивать её с
+рабочим окружением):
+
+```bash
+python3 -m venv buildenv
+source buildenv/bin/activate
+pip install -r requirements.txt -r requirements-build.txt
+pyinstaller --clean --noconfirm ExecutiveDocSystem.spec
+./dist/ExecutiveDocSystem/ExecutiveDocSystem
+```
+
+Что работает на Linux, а что нет:
+
+| Возможность | Linux | Windows |
+|---|---|---|
+| Ведение проектов, документов, выпуск версий | да | да |
+| Печать в PDF, комплект с реестром, реестр документов | да | да |
+| Открытие папки архива кнопкой в интерфейсе | нет — открывайте каталог вручную, путь показывает «Где лежат данные» | да |
+| Хранение ключа GigaChat | `~/.local/share` нет: ключ в открытом виде в `storage/settings.json` (предупреждение в интерфейсе) либо в переменной `EXECUTIVE_DOC_GIGACHAT_KEY` | DPAPI, ключ шифруется средствами Windows |
+| Сохранённый GigaChat-ключ переносится на другую ОС | нет, вводите заново | нет, вводите заново |
+
+Для GigaChat через служебную сеть задайте прокси переменными окружения
+(`HTTPS_PROXY=http://прокси:8080`) — приложение учитывает их при обращении к
+сервису.
+
 ### Сборка автономного приложения
 
 Описание сборки лежит в репозитории (`ExecutiveDocSystem.spec`), поэтому `.exe`
@@ -263,6 +314,9 @@ pytest
 ```
 
 Ручная приёмка собранного приложения на Windows — `docs/ПРИЁМКА_WINDOWS.md`.
+Включение интернет-ИИ и ввод ключа GigaChat — `docs/КЛЮЧ_GIGACHAT.md`
+(инструкция для пользователя, ключ вводится в приложении и никому не
+пересылается).
 Автотесты проверяют логику, но не проверяют шрифт и поля на бумаге и работу
 просмотрщика PDF.
 

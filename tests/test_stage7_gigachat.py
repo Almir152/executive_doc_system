@@ -346,3 +346,89 @@ def test_provider_is_not_built_without_configuration(monkeypatch):
         classmethod(lambda cls: cls(model="")),
     )
     assert build_internet_provider() is None
+
+
+def test_rejected_token_is_renewed_and_request_repeated(giga_server):
+    """Сервис отклонил токен: ключ обменяем заново и повторим запрос один раз."""
+    giga_server.chat_status = 401
+    giga_server.chat_body = {"message": "токен недействителен"}
+    provider = GigaChatProvider(GigaChatConfig(), "ключ")
+
+    calls = {"n": 0}
+    original = provider._ask_once
+
+    def flaky(prompt):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Первый ответ — отказ по устаревшему токену.
+            return original(prompt)
+        giga_server.chat_status = 200
+        giga_server.chat_body = {
+            "choices": [{"message": {"content": "1. Проверить срок."}}]
+        }
+        return original(prompt)
+
+    provider._ask_once = flaky
+
+    assert provider.ask("Проверь комплектность.") == "1. Проверить срок."
+    oauth_calls = [c for c in giga_server.calls if c["path"].endswith("/oauth")]
+    chat_calls = [c for c in giga_server.calls
+                  if c["path"].endswith("/chat/completions")]
+    assert len(oauth_calls) == 2
+    assert len(chat_calls) == 2
+    assert _header(chat_calls[0], "Authorization") == "Bearer token-1"
+    assert _header(chat_calls[1], "Authorization") == "Bearer token-3"
+
+
+def test_repeated_token_rejection_is_reported(giga_server):
+    """Повторный отказ не превращается в правдоподобный ответ."""
+    giga_server.chat_status = 401
+    giga_server.chat_body = {"message": "токен недействителен"}
+    provider = GigaChatProvider(GigaChatConfig(), "ключ")
+
+    result = provider({"request": "проверь комплектность", "files": []})
+
+    assert result["status"] == "error"
+    assert result["proposals"] == []
+    oauth_calls = [c for c in giga_server.calls if c["path"].endswith("/oauth")]
+    assert len(oauth_calls) == 2
+
+
+def test_request_goes_through_proxy_from_environment(monkeypatch):
+    """Через прокси запрос идёт с абсолютным адресом (служебные сети)."""
+    seen: list = []
+
+    class Proxy(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            return
+
+        def do_POST(self):
+            seen.append(self.path)
+            body = json.dumps({
+                "access_token": "token-через-прокси", "expires_in": 1800,
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    proxy = HTTPServer(("127.0.0.1", 0), Proxy)
+    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy.server_address[1]}")
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.setattr(
+        GigaChatConfig, "__init__",
+        _config_with_url("http://api.giga.invalid/v1",
+                         "http://api.giga.invalid/api/v2/oauth"),
+    )
+    try:
+        provider = GigaChatProvider(GigaChatConfig(), "ключ")
+        assert provider.access_token() == "token-через-прокси"
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+    # Прокси получает абсолютный адрес, а не относительный путь.
+    assert seen == ["http://api.giga.invalid/api/v2/oauth"]

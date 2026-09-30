@@ -14,7 +14,8 @@ from app.db.form_definitions import (
 )
 from app.db.models import NormativeForm, SectionKind
 from app.ui.document_form import (
-    DocumentFormPanel, ExploitationChoiceWidget, SignatureBlocksWidget,
+    DocumentFormPanel, ExploitationChoiceWidget, FormVersionWidget,
+    SignatureBlocksWidget,
 )
 from app.ui.project_window import ProjectWindow
 from app.ui.reference_picker import ReferenceMultiPicker
@@ -609,3 +610,34 @@ def test_released_document_keeps_its_form_version(db, project):
     db.refresh(document)
     assert document.form_version_id == issued.id
     panel.deleteLater()
+
+
+def test_failed_version_switch_restores_selection_in_list(db, project):
+    """Отказ в смене версии возвращает в списке ту, что реально в силе."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR
+    )
+    issued = db.query(NormativeForm).filter(
+        NormativeForm.doc_type == domain.DOC_TYPE_AOSR,
+        NormativeForm.version == FORM_VERSION_AOSR_OFFICIAL,
+    ).one()
+    document.form_version_id = issued.id
+    document.status = domain.DOC_STATUS_ISSUED
+    db.commit()
+
+    widget = FormVersionWidget(db, document.id, None)
+    # У выпущенного документа элемент управления выключен, поэтому проверяем
+    # поведение метода подмены версии напрямую.
+    widget.combo.setEnabled(True)
+    short = next(
+        i for i in range(widget.combo.count())
+        if f"v{FORM_VERSION_AOSR_SHORT}:" in widget.combo.itemText(i)
+    )
+    widget.combo.setCurrentIndex(short)
+    widget._activate(short)
+
+    assert f"v{FORM_VERSION_AOSR_OFFICIAL}:" in widget.combo.currentText()
+    assert "зафиксирована" in widget.error_label.text()
+    db.refresh(document)
+    assert document.form_version_id == issued.id
+    widget.deleteLater()

@@ -655,6 +655,18 @@ def _aosr_by_official_sample(version: int, *, short: bool) -> dict:
         )
         # Целевой объём п.56 обеспечивается именно этим вариантом.
         definition["layout"]["target_pages"] = "2"
+        # Проектировщика в разделе 1 нет, а в образце он есть: без этого
+        # раздела печать перескакивает с 1 на 3.
+        _insert_section(sections, {
+            "number": 2,
+            "title": "Сведения об участниках",
+            "blocks": [
+                {"key": "designer_org", "label": "Проектная организация",
+                 "source": SOURCE_PROJECT, "role": ROLE_DESIGNER,
+                 "note": "реквизиты участников приводятся в полном образце "
+                         "(версия 4)"},
+            ],
+        }, before=3)
         return definition
 
     definition["title"] = (

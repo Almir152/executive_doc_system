@@ -155,7 +155,12 @@ class FormVersionWidget(QGroupBox):
         version_id = self.combo.itemData(index)
         error = form_service.pin_form_version(self.db, self.document_id, version_id)
         self.error_label.setText(error)
-        if not error and self.on_change is not None:
+        if error:
+            # Версия не сохранилась: список обязан показать ту, что в силе,
+            # иначе экран противоречит состоянию документа (ТЗ п.96).
+            self.reload()
+            return
+        if self.on_change is not None:
             self.on_change()
 
 

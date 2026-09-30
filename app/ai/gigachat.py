@@ -25,6 +25,7 @@ import logging
 import ssl
 import time
 import urllib.parse
+import urllib.request
 import uuid
 
 log = logging.getLogger(__name__)
@@ -78,6 +79,33 @@ class GigaChatConfig:
         )
 
 
+def _connect(parts, timeout: int) -> tuple[http.client.HTTPConnection, str]:
+    """Соединение с учётом прокси из переменных окружения.
+
+    На служебных сетях доступ к интернету часто идёт через прокси; без его
+    учёта запрос не доходит до сервиса.
+    """
+    secure = parts.scheme == "https"
+    default_port = 443 if secure else 80
+    target_port = parts.port or default_port
+    proxy = urllib.request.getproxies().get(parts.scheme)
+    host, port = parts.hostname, target_port
+    if proxy:
+        proxy_parts = urllib.parse.urlsplit(proxy)
+        host = proxy_parts.hostname
+        port = proxy_parts.port or default_port
+    connection: http.client.HTTPConnection
+    if secure:
+        connection = http.client.HTTPSConnection(
+            host, port, timeout=timeout, context=ssl.create_default_context()
+        )
+    else:
+        connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    if proxy and secure:
+        connection.set_tunnel(parts.hostname, target_port)
+    return connection, host
+
+
 def _send(url: str, body: bytes, headers: dict, timeout: int) -> tuple[int, str]:
     """POST с телом и точными именами заголовков.
 
@@ -85,18 +113,13 @@ def _send(url: str, body: bytes, headers: dict, timeout: int) -> tuple[int, str]
     «RqUID», поэтому запрос выполняется напрямую через http.client.
     """
     parts = urllib.parse.urlsplit(url)
-    if parts.scheme != "https":
-        connection = http.client.HTTPConnection(
-            parts.hostname, parts.port or 80, timeout=timeout
-        )
-    else:
-        connection = http.client.HTTPSConnection(
-            parts.hostname, parts.port or 443, timeout=timeout,
-            context=ssl.create_default_context(),
-        )
+    connection, _host = _connect(parts, timeout)
     path = parts.path or "/"
     if parts.query:
         path = f"{path}?{parts.query}"
+    if urllib.request.getproxies().get(parts.scheme) and parts.scheme == "http":
+        # Через прокси путь указывается абсолютным адресом.
+        path = urllib.parse.urlunsplit(parts)
     try:
         connection.request("POST", path, body=body, headers=headers)
         response = connection.getresponse()
@@ -206,6 +229,18 @@ class GigaChatProvider:
 
     def ask(self, prompt: str) -> str:
         """Текстовый запрос к модели."""
+        try:
+            return self._ask_once(prompt)
+        except GigaChatError as exc:
+            if "401" not in str(exc):
+                raise
+            # Токен мог быть отозван или срок вышел раньше расчётного:
+            # ключ обменяем заново и повторим запрос один раз.
+            log.info("GigaChat отклонил токен, обновляю и повторяю запрос")
+            self._token = None
+            return self._ask_once(prompt)
+
+    def _ask_once(self, prompt: str) -> str:
         data = _post(
             f"{self.config.base_url}/chat/completions",
             {
