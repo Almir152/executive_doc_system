@@ -40,14 +40,9 @@ def seed_reference_data(session: Session) -> dict[str, int]:
         "section_kinds": _ensure(
             session, SectionKind, "code", domain.SECTION_KINDS_INITIAL
         ),
-        "material_types": _ensure(session, MaterialType, "code", [
-            ("PIPE", "Труба"),
-            ("FITTING", "Соединительные детали"),
-            ("VALVE", "Запорная арматура"),
-            ("CABLE", "Кабельная продукция"),
-            ("EQUIPMENT", "Оборудование"),
-            ("OTHER", "Прочие материалы"),
-        ]),
+        "material_types": _ensure(
+            session, MaterialType, "code", domain.MATERIAL_TYPES_INITIAL
+        ),
     }
     session.commit()
     if any(counts.values()):

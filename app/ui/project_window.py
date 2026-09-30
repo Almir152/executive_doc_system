@@ -310,9 +310,7 @@ class ProjectWindow(QWidget):
         self.reload()
 
     def add_section(self) -> None:
-        kinds = (
-            self.db.query(SectionKind).order_by(SectionKind.sort_order).all()
-        )
+        kinds = self.db.query(SectionKind).order_by(SectionKind.code).all()
         if not kinds:
             QMessageBox.warning(
                 self, "Справочник разделов пуст",

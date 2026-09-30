@@ -19,6 +19,7 @@ from app.core.services.storage_service import (
     calculate_hash, find_by_hash,
 )
 from app.core.services.exporter import export_package
+from app.ui.directories_page import DirectoryPage
 from app.ui.project_window import ProjectWindow
 from app.core.services.project_service import (
     ProjectError, can_delete_project, delete_project,
@@ -81,7 +82,7 @@ class MainWindow(QMainWindow):
         self.nav_list = QListWidget()
         self.nav_list.addItems([
             "Проекты", "Архив файлов (SHA-256)", "Нормативы",
-            "Формы документов", "ИИ-Агент", "Настройки",
+            "Формы документов", "Справочники", "ИИ-Агент", "Настройки",
         ])
         self.nav_list.setFixedWidth(220)
         self.nav_list.setCurrentRow(0)
@@ -101,6 +102,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.create_archive_page())
         self.stack.addWidget(self.create_norms_page())
         self.stack.addWidget(self.create_forms_page())
+        self.directories_page = DirectoryPage(self.db)
+        self.stack.addWidget(self.directories_page)
         self.stack.addWidget(self.create_ai_page())
         self.stack.addWidget(self.create_settings_page())
 

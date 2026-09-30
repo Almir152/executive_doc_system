@@ -318,3 +318,33 @@ def test_section_race_is_reported_as_readable_error(db, project, monkeypatch):
     monkeypatch.undo()
 
     assert db.query(ProjectSection).count() == 0, "сессия осталась в сломанном состоянии"
+
+
+@pytest.mark.gui
+def test_project_window_add_section_through_dialogs(db, project, qapp, monkeypatch):
+    """Добавление раздела из окна проекта доходит до БД.
+
+    Справочник разделов не имеет поля sort_order: обращение к нему роняло
+    окно при первом же добавлении, а сервисные тесты это не ловили.
+    """
+    from PyQt6.QtWidgets import QInputDialog
+
+    from app.ui.project_window import ProjectWindow
+
+    kind = db.query(SectionKind).first()
+    answers = ["КЖ", "Конструкции железобетонные"]
+    monkeypatch.setattr(
+        QInputDialog, "getItem", staticmethod(lambda *a, **k: (kind.name, True))
+    )
+    monkeypatch.setattr(
+        QInputDialog, "getText",
+        staticmethod(lambda *a, **k: (answers.pop(0), True)),
+    )
+
+    window = ProjectWindow(db, project.id)
+    window.show()
+    window.add_section()
+
+    assert db.query(ProjectSection).count() == 1
+    assert window.sections_table.item(0, 0).text() == "КЖ"
+    window.close()
