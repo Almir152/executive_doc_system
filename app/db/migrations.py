@@ -22,7 +22,7 @@ from app.core import domain
 logger = logging.getLogger(__name__)
 
 # Текущая версия схемы. Увеличивать при добавлении миграции.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Справочники и формы, которые миграция создаёт сама, до переноса данных.
 # Миграция не должна зависеть от того, что create_all уже отработал.
@@ -654,6 +654,22 @@ def migration_005(conn) -> None:
     create_indexes(conn)
 
 
+def migration_006(conn) -> None:
+    """Связь строки материала с актом испытаний. ТЗ п.44, 45, 49.
+
+    Добавлена таблица ``material_test_act_links``: материал участвует в
+    конкретных актах испытаний. Связь явная и ручная — сертификат или иной
+    документ качества прикрепляется к конкретному акту, а не ко всем актам
+    материода сразу (ТЗ п.45).
+
+    Существующие данные не меняются: новая таблица пуста.
+    """
+    from app.db.models import MaterialTestActLink
+
+    create_table(conn, MaterialTestActLink.__table__)
+    create_indexes(conn)
+
+
 # =====================================================================
 # Реестр миграций
 # =====================================================================
@@ -664,6 +680,7 @@ MIGRATIONS = [
     (3, "protect_issued_document_versions", migration_003),
     (4, "restore_version_number_uniqueness", migration_004),
     (5, "document_dates_and_links", migration_005),
+    (6, "material_test_act_links", migration_006),
 ]
 
 

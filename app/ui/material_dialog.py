@@ -145,3 +145,79 @@ def _archive_choices(db, project_id):
         if has_file:
             choices.append(document)
     return choices
+
+
+class MaterialActsDialog(QDialog):
+    """Акты испытаний, в которых проверялся материал. ТЗ п.44, 45.
+
+    Связь выбирает оператор поштучно: массовое прикрепление документа
+    качества ко всем актам материала недопустимо (ТЗ п.45), поэтому и
+    список, и отметка здесь явные.
+    """
+
+    def __init__(self, db, project_id, material, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.project_id = project_id
+        self.material = material
+
+        self.setWindowTitle("Акты испытаний материала")
+        layout = QVBoxLayout(self)
+
+        self.hint = QLabel(
+            f"Отметьте акты испытаний, в которых проверялся материал "
+            f"«{material.name}». Документ качества прикрепляется к "
+            "конкретному акту, а не ко всем сразу (ТЗ п.45)."
+        )
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QListWidget, QListWidgetItem
+
+        from app.core.services import link_service
+
+        already = {
+            act.id for act in link_service.list_test_acts_of_material(db, material.id)
+        }
+        acts = link_service.project_test_acts(db, project_id)
+        self.acts_list = QListWidget()
+        for act in acts:
+            date_text = act.doc_date.strftime("%d.%m.%Y") if act.doc_date else "дата не задана"
+            item = QListWidgetItem(f"Акт испытаний № {act.number} ({date_text})")
+            item.setData(Qt.ItemDataRole.UserRole, act.id)
+            item.setFlags(
+                item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable
+                if act.id in already else item.flags()
+            )
+            item.setCheckState(
+                Qt.CheckState.Checked if act.id in already
+                else Qt.CheckState.Unchecked
+            )
+            if act.id in already:
+                item.setText(item.text() + " — уже указан")
+            self.acts_list.addItem(item)
+        layout.addWidget(self.acts_list)
+
+        if not acts:
+            self.hint.setText(
+                "В проекте нет актов испытаний. Создайте акт испытаний "
+                "(ТЗ п.36) и свяжите с ним материал."
+            )
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def selected_acts(self) -> list[int]:
+        """Акты, отмеченные оператором."""
+        from PyQt6.QtCore import Qt
+
+        return [
+            self.acts_list.item(row).data(Qt.ItemDataRole.UserRole)
+            for row in range(self.acts_list.count())
+            if self.acts_list.item(row).checkState() == Qt.CheckState.Checked
+        ]

@@ -37,7 +37,7 @@ from app.db.database import SessionLocal, check_integrity, get_schema_version, i
 from app.db.migrations import SCHEMA_VERSION  # noqa: E402
 from app.db.models import (  # noqa: E402
     ArchiveDocument, Direction, Document, DocumentArchiveLink, DocumentLink,
-    DocumentVersion, Package, PackageEntry, Project,
+    DocumentVersion, MaterialType, Package, PackageEntry, Project,
 )
 
 FAILURES: list[str] = []
@@ -257,6 +257,46 @@ def main() -> int:
         == "Комплект 02",
     )
 
+    # --- Материал и акт испытаний (ТЗ п.44, 45, 49) ---
+    from app.core.services import link_service
+
+    material_type = db.query(MaterialType).filter(MaterialType.code == "BETON").first()
+    if material_type is None:
+        material_type = MaterialType(code="BETON", name="Бетон и растворы")
+        db.add(material_type)
+        db.commit()
+    material = link_service.save_material(
+        db, project.id, name="Бетон Б25", material_type_id=material_type.id,
+        unit="м³", quantity=120.0,
+    )
+    test_act = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_TEST_ACT, number="1",
+        doc_date=_date(2024, 5, 20),
+    )
+    other_test_act = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_TEST_ACT, number="2",
+        doc_date=_date(2024, 6, 3),
+    )
+    link_service.link_material_to_test_act(db, material.id, test_act.id)
+    check("материал отнесён к конкретному акту испытаний (ТЗ п.44)",
+          [act.number for act in
+           link_service.list_test_acts_of_material(db, material.id)] == ["1"])
+    check("к акту без явной связи материал не прикрепляется (ТЗ п.45)",
+          link_service.list_materials_of_act(db, other_test_act.id) == [])
+    try:
+        link_service.link_material_to_test_act(db, material.id, other_test_act.id)
+        link_service.link_material_to_test_act(db, material.id, other_test_act.id)
+        check("повторная связь материала отклонена (ТЗ п.45)", False, "связи нет")
+    except link_service.MaterialError as exc:
+        check("повторная связь материала отклонена (ТЗ п.45)", True, str(exc)[:60])
+    try:
+        link_service.link_material_to_test_act(db, material.id, aosr1.id)
+        check("материал не связывается с актом не-испытаний (ТЗ п.36, 44)",
+              False, "связь создана")
+    except link_service.MaterialError as exc:
+        check("материал не связывается с актом не-испытаний (ТЗ п.36, 44)",
+              True, str(exc)[:60])
+
     # --- История проекта сохраняет результаты работы (ТЗ п.86) ---
     history_types = [event.event_type for event in list_events(db, project.id)]
     for expected, label in (
@@ -266,6 +306,7 @@ def main() -> int:
         (domain.HISTORY_PACKAGE_EXPORTED, "сформированный комплект"),
         (domain.HISTORY_REGISTER_WRITTEN, "реестр комплекта"),
         (domain.HISTORY_ARCHIVE_FILE_ADDED, "изменение архивных документов"),
+        (domain.HISTORY_MATERIAL_LINK_ADDED, "связь материала с актом испытаний"),
     ):
         check(f"история сохраняет: {label} (ТЗ п.86)", expected in history_types)
     register_event = next(
@@ -320,7 +361,6 @@ def main() -> int:
     db.close()
 
     print("\n=== НЕ РЕАЛИЗОВАНО ===")
-    print("  - связь акта испытаний со строкой материала (п.44-48)")
     print("  - BACKUP, восстановление и перенос (п.74, 98)")
     print("  - обновление через миграции (п.97)")
     print("  - ИИ: контекст по запросу, черновики и подтверждение (п.101-106)")

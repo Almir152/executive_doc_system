@@ -419,9 +419,20 @@ class ProjectWindow(QWidget):
         material_buttons.addWidget(self.material_search, stretch=1)
         materials_layout.addLayout(material_buttons)
 
-        self.materials_table = QTableWidget(0, 5)
+        # ТЗ п.44, 45: материал относится к конкретным актам испытаний.
+        self.btn_material_acts = QPushButton("+ Акты испытаний материала")
+        self.btn_material_acts.clicked.connect(self.add_material_test_acts)
+        material_buttons.addWidget(self.btn_material_acts)
+        self.btn_material_acts_remove = QPushButton("Убрать связь с актом")
+        self.btn_material_acts_remove.setStyleSheet(
+            "background-color: #ffdddd; color: #990000;"
+        )
+        self.btn_material_acts_remove.clicked.connect(self.delete_material_test_act)
+        material_buttons.addWidget(self.btn_material_acts_remove)
+
+        self.materials_table = QTableWidget(0, 6)
         self.materials_table.setHorizontalHeaderLabels(
-            ["Тип", "Наименование", "Ед.", "Кол-во", "Примечание"]
+            ["Тип", "Наименование", "Ед.", "Кол-во", "Примечание", "Актов"]
         )
         self.materials_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
@@ -432,6 +443,18 @@ class ProjectWindow(QWidget):
         materials_layout.addWidget(self.materials_table)
 
         self.links_box = QGroupBox("Связанные документы выбранного документа")
+        self.material_acts_hint = QLabel(
+            "Сначала выберите строку с материалом (ТЗ п.44)."
+        )
+        self.material_acts_hint.setWordWrap(True)
+        materials_layout.addWidget(self.material_acts_hint)
+        self.material_acts_table = QTableWidget(0, 2)
+        self.material_acts_table.setHorizontalHeaderLabels(["Акт испытаний", "Дата"])
+        self.material_acts_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        materials_layout.addWidget(self.material_acts_table)
+
         links_layout = QVBoxLayout(self.links_box)
         link_buttons = QHBoxLayout()
         self.btn_link = QPushButton("+ Связь с файлом архива")
@@ -783,15 +806,118 @@ class ProjectWindow(QWidget):
         materials = link_service.list_materials(self.db, self.project_id, search)
         self.materials_table.setRowCount(len(materials))
         for row, material in enumerate(materials):
+            acts = link_service.list_test_acts_of_material(self.db, material.id)
             values = [
                 material.material_type.name if material.material_type else "—",
                 material.name,
                 material.unit or "—",
                 _quantity_label(material.quantity),
                 material.note or "—",
+                str(len(acts)),
             ]
             for column, value in enumerate(values):
                 self.materials_table.setItem(row, column, QTableWidgetItem(value))
+        self._reload_material_acts()
+
+    def _selected_material(self):
+        """Материал, выбранный в таблице (ТЗ п.44)."""
+        row = self.materials_table.currentRow()
+        materials = link_service.list_materials(
+            self.db, self.project_id, self.material_search.text()
+        )
+        if row < 0 or row >= len(materials):
+            return None
+        return materials[row]
+
+    def add_material_test_acts(self) -> None:
+        """Указать акты испытаний, в которых проверялся материал (ТЗ п.44, 45)."""
+        from app.ui.material_dialog import MaterialActsDialog
+
+        material = self._selected_material()
+        if material is None:
+            QMessageBox.information(
+                self, "Выберите материал",
+                "Сначала выберите строку с материалом (ТЗ п.44).",
+            )
+            return
+        dialog = MaterialActsDialog(
+            self.db, self.project_id, material, parent=self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        created = 0
+        for document_id in dialog.selected_acts():
+            try:
+                link_service.link_material_to_test_act(
+                    self.db, material.id, document_id
+                )
+            except link_service.MaterialError as exc:
+                QMessageBox.warning(self, "Связь не создана", str(exc))
+                return
+            created += 1
+        self._reload_materials()
+        if created:
+            QMessageBox.information(
+                self, "Связи созданы",
+                f"Актов испытаний указано: {created}. Документ качества "
+                "прикрепляется к конкретному акту (ТЗ п.45).",
+            )
+
+    def delete_material_test_act(self) -> None:
+        """Убрать связь материала с актом испытаний (ТЗ п.52)."""
+        material = self._selected_material()
+        if material is None:
+            QMessageBox.information(
+                self, "Выберите материал",
+                "Сначала выберите строку с материалом (ТЗ п.44).",
+            )
+            return
+        link = self.material_acts_table.currentRow()
+        acts = link_service.list_test_acts_of_material(self.db, material.id)
+        if link < 0 or link >= len(acts):
+            QMessageBox.information(
+                self, "Выберите связь",
+                f"Выберите связь с актом испытаний в поле «Акты испытаний: "
+                f"{material.name}» (ТЗ п.44).",
+            )
+            return
+        answer = QMessageBox.question(
+            self, "Удаление связи",
+            f"Убрать материал «{material.name}» из акта испытаний "
+            f"№ {acts[link].number}? Документы не удаляются (ТЗ п.52).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        for item in material.test_act_links:
+            if item.document_id == acts[link].id:
+                link_service.unlink_material_from_test_act(self.db, item.id)
+                break
+        self._reload_materials()
+        self._reload_material_acts()
+
+    def _reload_material_acts(self) -> None:
+        """Показать акты испытаний выбранного материала (ТЗ п.44)."""
+        material = self._selected_material()
+        if material is None:
+            self.material_acts_table.setRowCount(0)
+            self.material_acts_hint.setText(
+                "Сначала выберите строку с материалом (ТЗ п.44)."
+            )
+            return
+        acts = link_service.list_test_acts_of_material(self.db, material.id)
+        self.material_acts_table.setRowCount(len(acts))
+        for row, act in enumerate(acts):
+            self.material_acts_table.setItem(row, 0, QTableWidgetItem(
+                f"Акт испытаний № {act.number}"
+            ))
+            self.material_acts_table.setItem(row, 1, QTableWidgetItem(
+                act.doc_date.strftime("%d.%m.%Y") if act.doc_date else "—"
+            ))
+        self.material_acts_hint.setText(
+            f"Актов испытаний у материала «{material.name}»: {len(acts)}. "
+            "Документ качества выбирается для конкретного акта (ТЗ п.45)."
+        )
 
     def add_material(self) -> None:
         from app.ui.material_dialog import MaterialDialog

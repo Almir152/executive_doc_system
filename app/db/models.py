@@ -254,9 +254,48 @@ class Material(Base):
 
     project = relationship("Project", back_populates="materials")
     material_type = relationship("MaterialType", lazy="selectin")
+    # ТЗ п.44, 45: материал участвует в конкретных актах испытаний, и
+    # документ качества выбирается для конкретного акта. Связь явная:
+    # прикреплять сертификат ко всем актам материала нельзя (ТЗ п.45).
+    test_act_links = relationship(
+        "MaterialTestActLink", back_populates="material",
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self):
         return f"<Material {self.name}>"
+
+
+class MaterialTestActLink(Base):
+    """Материал — акт испытаний. ТЗ п.44, 45, 49.
+
+    Строка материала и акт испытаний связаны явно: только те акты, которые
+    оператор указал. Автоматическое прикрепление документа качества ко всем
+    актам материала не допускается (ТЗ п.45).
+    """
+
+    __tablename__ = 'material_test_act_links'
+    __table_args__ = (
+        UniqueConstraint('material_id', 'document_id', name='uq_material_test_act'),
+        Index('ix_material_test_act_links_document', 'document_id'),
+    )
+
+    # Суррогатный ключ — как у DocumentLink: по нему связь удаляется и
+    # отображается в интерфейсе.
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    material_id = Column(
+        Integer, ForeignKey('materials.id', ondelete="CASCADE"), nullable=False
+    )
+    document_id = Column(
+        Integer, ForeignKey('documents.id', ondelete="CASCADE"), nullable=False
+    )
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    material = relationship("Material", back_populates="test_act_links")
+    document = relationship("Document", lazy="selectin")
+
+    def __repr__(self):
+        return f"<MaterialTestActLink {self.material_id}-{self.document_id}>"
 
 
 # =====================================================================
@@ -432,6 +471,11 @@ class Document(Base):
         foreign_keys="DocumentLink.document_id",
         cascade="all, delete-orphan",
         order_by="DocumentLink.order_no",
+    )
+    # ТЗ п.44, 45: акты испытаний, в которых проверялся этот материал.
+    material_links = relationship(
+        "MaterialTestActLink", back_populates="document",
+        cascade="all, delete-orphan",
     )
     signature_blocks = relationship(
         "SignatureBlock", back_populates="document", cascade="all, delete-orphan"

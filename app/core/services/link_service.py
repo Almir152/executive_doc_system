@@ -17,8 +17,127 @@ from app.core import domain
 from app.core.services.project_service import record_event
 from app.db.models import (
     ArchiveDocument, ArchiveFileVersion, Document, DocumentArchiveLink, DocumentLink,
-    Material, MaterialType, Project,
+    Material, MaterialTestActLink, MaterialType, Project,
 )
+
+
+# =====================================================================
+# МАТЕРИАЛ И АКТ ИСПЫТАНИЙ (ТЗ п.44, 45, 49)
+# =====================================================================
+
+
+def link_material_to_test_act(
+    db: Session, material_id: int, document_id: int
+) -> MaterialTestActLink:
+    """Указать, что материал проверялся в конкретном акте испытаний.
+
+    Связь всегда явная: оператор выбирает акт для материала, а документ
+    качества прикрепляется к этому же акту (ТЗ п.45). Прикреплять сертификат
+    ко всем актам материала нельзя, поэтому массовой операции здесь нет
+    вовсе, а повторная связь отклоняется.
+    """
+    material = db.get(Material, material_id)
+    if material is None:
+        raise MaterialError(f"Материал не найден: {material_id}")
+    document = db.get(Document, document_id)
+    if document is None:
+        raise MaterialError(f"Документ не найден: {document_id}")
+    if document.doc_type != domain.DOC_TYPE_TEST_ACT:
+        raise MaterialError(
+            f"С материалом связывается только акт испытаний, а "
+            f"{document.type_label} № {document.number} — это не акт "
+            "испытаний (ТЗ п.36, 44)."
+        )
+    if material.project_id != document.project_id:
+        raise MaterialError(
+            "Материал и акт испытаний относятся к разным проектам: связь не "
+            "создаётся (ТЗ п.52)."
+        )
+
+    link = MaterialTestActLink(material_id=material.id, document_id=document.id)
+    db.add(link)
+    try:
+        db.flush()
+        record_event(
+            db, material.project_id, domain.HISTORY_MATERIAL_LINK_ADDED,
+            f"Материал «{material.name}» отнесён к акту испытаний "
+            f"№ {document.number} (ТЗ п.44, 45)",
+            entity_type="material", entity_id=material.id,
+            payload={"document_id": document.id, "document_number": document.number},
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise MaterialError(
+            f"Материал «{material.name}» уже отнесён к акту испытаний "
+            f"№ {document.number}. Повторная связь не создаётся (ТЗ п.45)."
+        ) from exc
+    db.refresh(link)
+    return link
+
+
+def unlink_material_from_test_act(db: Session, link_id: int) -> None:
+    """Убрать связь материала с актом испытаний (ТЗ п.52)."""
+    link = db.get(MaterialTestActLink, link_id)
+    if link is None:
+        raise MaterialError(f"Связь не найдена: {link_id}")
+    material, document = link.material, link.document
+    message = (
+        f"Материал «{material.name}» больше не отнесён к акту испытаний "
+        f"№ {document.number} (ТЗ п.52)"
+    )
+    db.delete(link)
+    db.flush()
+    record_event(
+        db, material.project_id, domain.HISTORY_MATERIAL_LINK_REMOVED, message,
+        entity_type="material", entity_id=material.id,
+        payload={"document_id": document.id},
+    )
+    db.commit()
+
+
+def list_materials_of_act(db: Session, document_id: int) -> list[Material]:
+    """Материалы, проверявшиеся в этом акте испытаний (ТЗ п.44)."""
+    return list(
+        db.scalars(
+            select(Material)
+            .join(
+                MaterialTestActLink,
+                MaterialTestActLink.material_id == Material.id,
+            )
+            .where(MaterialTestActLink.document_id == document_id)
+            .order_by(Material.name, Material.id)
+        ).all()
+    )
+
+
+def list_test_acts_of_material(db: Session, material_id: int) -> list[Document]:
+    """Акты испытаний, в которых проверялся материал (ТЗ п.44)."""
+    return list(
+        db.scalars(
+            select(Document)
+            .join(
+                MaterialTestActLink,
+                MaterialTestActLink.document_id == Document.id,
+            )
+            .where(MaterialTestActLink.material_id == material_id)
+            .order_by(Document.doc_type, Document.number, Document.id)
+        ).all()
+    )
+
+
+def project_test_acts(db: Session, project_id: int) -> list[Document]:
+    """Все акты испытаний проекта (ТЗ п.36)."""
+    return list(
+        db.scalars(
+            select(Document)
+            .where(
+                Document.project_id == project_id,
+                Document.doc_type == domain.DOC_TYPE_TEST_ACT,
+            )
+            .order_by(Document.number, Document.id)
+        ).all()
+    )
 
 
 class MaterialError(Exception):
