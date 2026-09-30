@@ -284,6 +284,34 @@ def test_main_window_opens_project_window(db, project, qapp):
     window.close()
 
 
+@pytest.mark.gui
+def test_card_dialog_marks_organizations_with_search(db, project, qapp):
+    """Необходимые организации отмечаются в списке с поиском (ТЗ п.17, 20)."""
+    from app.ui.project_window import ProjectCardDialog
+
+    customer = Organization(short_name="ЗАО «Заказчик»", inn="7701111111")
+    partner = Organization(short_name="ООО «Подрядчик»", inn="7702222222")
+    db.add_all([customer, partner])
+    db.commit()
+    service.update_project_card(
+        db, project.id, title=project.title,
+        organization_ids=[customer.id, partner.id],
+    )
+
+    dialog = ProjectCardDialog(db, service.get_project(db, project.id))
+    picker = dialog.organizations_list
+
+    assert picker.item_count() == 2
+    assert sorted(picker.selected_values()) == sorted([customer.id, partner.id])
+    assert dialog.values()["organization_ids"] == [customer.id, partner.id]
+    picker.search.setText("подряд")
+    assert dialog.values()["organization_ids"] == [customer.id, partner.id], (
+        "поиск не должен сбрасывать отметки"
+    )
+    picker.set_selected_values([customer.id])
+    assert dialog.values()["organization_ids"] == [customer.id]
+
+
 def test_duplicate_section_code_is_blocked_by_database(db, project):
     """Уникальность кода держит сама БД, а не только проверка в сервисе."""
     from sqlalchemy.exc import IntegrityError

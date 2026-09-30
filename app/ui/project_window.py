@@ -10,9 +10,9 @@ from datetime import date, datetime
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from app.core import domain
@@ -22,6 +22,7 @@ from app.db.models import (
     ArchiveDocument, Document, Organization, Package,
 )
 from app.ui.document_form import DocumentFormPanel
+from app.ui.reference_picker import ReferenceMultiPicker, ReferencePicker
 from app.ui.section_dialog import SectionDialog, kind_options as db_kinds
 
 _DATA_ROLE = Qt.ItemDataRole.UserRole
@@ -139,27 +140,27 @@ class ProjectCardDialog(QDialog):
         form.addRow("Наименование *", self.title_edit)
         form.addRow("Адрес", self.address_edit)
 
-        self.customer_combo = QComboBox()
-        self.contractor_combo = QComboBox()
-        self.organizations_list = QListWidgetMulti()
-        for combo, current in (
+        organizations = db.query(Organization).order_by(Organization.short_name).all()
+        org_items = [(org.short_name, org.id) for org in organizations]
+        self.customer_combo = ReferencePicker("— не указан —")
+        self.contractor_combo = ReferencePicker("— не указан —")
+        for picker, current in (
             (self.customer_combo, project.customer_org_id),
             (self.contractor_combo, project.general_contractor_org_id),
         ):
-            combo.addItem("— не указан —", None)
-            for org in db.query(Organization).order_by(Organization.short_name).all():
-                combo.addItem(org.short_name, org.id)
-            index = combo.findData(current)
-            if index >= 0:
-                combo.setCurrentIndex(index)
+            picker.set_reference_items(org_items)
+            picker.set_current_data(current)
         form.addRow("Заказчик", self.customer_combo)
         form.addRow("Генеральный подрядчик", self.contractor_combo)
 
+        self.organizations_list = ReferenceMultiPicker()
+        self.organizations_list.set_reference_items(org_items)
         form.addRow("Необходимые организации", self.organizations_list)
         layout.addLayout(form)
 
-        for org in project.organizations:
-            self.organizations_list.addItem(org.short_name, org.id)
+        self.organizations_list.set_selected_values(
+            [org.id for org in project.organizations]
+        )
 
         hint = QLabel(
             "Звёздочкой отмечены обязательные поля. Правка сохраняется "
@@ -181,35 +182,8 @@ class ProjectCardDialog(QDialog):
             "address": self.address_edit.text(),
             "customer_org_id": self.customer_combo.currentData(),
             "general_contractor_org_id": self.contractor_combo.currentData(),
-            "organization_ids": self.organizations_list.checked_ids(),
+            "organization_ids": self.organizations_list.selected_values(),
         }
-
-
-class QListWidgetMulti(QWidget):
-    """Отметка нескольких организаций (ТЗ п.17)."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.list = QListWidget()
-        layout.addWidget(self.list)
-
-    def addItem(self, text: str, data=None):
-        item = QListWidgetItem(text)
-        item.setData(_DATA_ROLE, data)
-        item.setFlags(item.flags() | _CHECKABLE)
-        self.list.addItem(item)
-
-    def checked_ids(self) -> list[int]:
-        result = []
-        for row in range(self.list.count()):
-            item = self.list.item(row)
-            if item.checkState() == Qt.CheckState.Checked:
-                value = item.data(_DATA_ROLE)
-                if value is not None:
-                    result.append(value)
-        return result
 
 
 class ProjectWindow(QWidget):
