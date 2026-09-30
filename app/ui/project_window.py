@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core import domain
-from app.core.services import document_service
+from app.core.services import document_service, link_service
 from app.core.services import project_service as service
 from app.db.models import (
     ArchiveDocument, Organization, Package, SectionKind,
@@ -282,6 +282,67 @@ class ProjectWindow(QWidget):
         documents_layout.addWidget(self.documents_hint)
         layout.addWidget(documents_box)
 
+        self.materials_box = QGroupBox(
+            "Материалы (ТЗ п.44) и связи документов (ТЗ п.45, 47, 48)"
+        )
+        materials_layout = QVBoxLayout(self.materials_box)
+        material_buttons = QHBoxLayout()
+        self.btn_add_material = QPushButton("+ Материал")
+        self.btn_add_material.clicked.connect(self.add_material)
+        material_buttons.addWidget(self.btn_add_material)
+        self.btn_delete_material = QPushButton("Удалить материал")
+        self.btn_delete_material.setStyleSheet(
+            "background-color: #ffdddd; color: #990000;"
+        )
+        self.btn_delete_material.clicked.connect(self.delete_material)
+        material_buttons.addWidget(self.btn_delete_material)
+        self.material_search = QLineEdit()
+        self.material_search.setPlaceholderText("Поиск материала (ТЗ п.44)")
+        self.material_search.textChanged.connect(self._reload_materials)
+        material_buttons.addWidget(self.material_search, stretch=1)
+        materials_layout.addLayout(material_buttons)
+
+        self.materials_table = QTableWidget(0, 5)
+        self.materials_table.setHorizontalHeaderLabels(
+            ["Тип", "Наименование", "Ед.", "Кол-во", "Примечание"]
+        )
+        self.materials_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.materials_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        materials_layout.addWidget(self.materials_table)
+
+        self.links_box = QGroupBox("Связанные документы выбранного документа")
+        links_layout = QVBoxLayout(self.links_box)
+        link_buttons = QHBoxLayout()
+        self.btn_link = QPushButton("+ Связь с файлом архива")
+        self.btn_link.clicked.connect(self.add_link)
+        link_buttons.addWidget(self.btn_link)
+        self.btn_unlink = QPushButton("Удалить связь")
+        self.btn_unlink.setStyleSheet("background-color: #ffdddd; color: #990000;")
+        self.btn_unlink.clicked.connect(self.delete_link)
+        link_buttons.addWidget(self.btn_unlink)
+        link_buttons.addStretch()
+        links_layout.addLayout(link_buttons)
+
+        self.links_table = QTableWidget(0, 4)
+        self.links_table.setHorizontalHeaderLabels(
+            ["Файл", "Категория", "Роль", "Версия"]
+        )
+        self.links_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        links_layout.addWidget(self.links_table)
+        self.links_hint = QLabel(
+            "Связи показываются для документа, выбранного выше."
+        )
+        self.links_hint.setWordWrap(True)
+        links_layout.addWidget(self.links_hint)
+        layout.addWidget(self.materials_box)
+        layout.addWidget(self.links_box)
+
         summary_box = QGroupBox("Связанные документы, комплекты и история")
         summary_layout = QVBoxLayout(summary_box)
         self.summary_label = QLabel()
@@ -310,6 +371,8 @@ class ProjectWindow(QWidget):
         self._load_documents(project)
         self._load_summary(project)
         self._load_history(project)
+        self._reload_materials()
+        self._reload_links()
 
     def _card_text(self, project) -> str:
         parts = [
@@ -401,6 +464,150 @@ class ProjectWindow(QWidget):
             QMessageBox.warning(self, "Карточка не сохранена", str(exc))
             return
         self.reload()
+
+    # -----------------------------------------------------------------
+    # МАТЕРИАЛЫ И СВЯЗИ (ТЗ п.44, 45, 47, 48)
+    # -----------------------------------------------------------------
+    def _reload_materials(self) -> None:
+        search = self.material_search.text() if hasattr(self, "material_search") else ""
+        materials = link_service.list_materials(self.db, self.project_id, search)
+        self.materials_table.setRowCount(len(materials))
+        for row, material in enumerate(materials):
+            values = [
+                material.material_type.name if material.material_type else "—",
+                material.name,
+                material.unit or "—",
+                _quantity_label(material.quantity),
+                material.note or "—",
+            ]
+            for column, value in enumerate(values):
+                self.materials_table.setItem(row, column, QTableWidgetItem(value))
+
+    def add_material(self) -> None:
+        from app.ui.material_dialog import MaterialDialog
+
+        dialog = MaterialDialog(self.db, self.project_id, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            link_service.save_material(self.db, self.project_id, **dialog.values())
+        except link_service.MaterialError as exc:
+            QMessageBox.warning(self, "Материал не сохранён", str(exc))
+            return
+        self._reload_materials()
+
+    def delete_material(self) -> None:
+        row = self.materials_table.currentRow()
+        materials = link_service.list_materials(
+            self.db, self.project_id, self.material_search.text()
+        )
+        if row < 0 or row >= len(materials):
+            QMessageBox.information(
+                self, "Выберите материал", "Сначала выберите строку с материалом."
+            )
+            return
+        material = materials[row]
+        answer = QMessageBox.question(
+            self, "Удаление материала",
+            f"Удалить материал «{material.name}»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            link_service.delete_material(self.db, material.id)
+        except link_service.MaterialError as exc:
+            QMessageBox.warning(self, "Удаление невозможно", str(exc))
+            return
+        self._reload_materials()
+
+    def _reload_links(self) -> None:
+        document = self._selected_document_quiet()
+        if document is None:
+            self.links_table.setRowCount(0)
+            self.links_hint.setText(
+                "Связи показываются для документа, выбранного в перечне выше."
+            )
+            return
+        links = link_service.list_document_links(self.db, document.id)
+        self.links_hint.setText(
+            f"Связи документа "
+            f"{domain.DOC_TYPE_LABELS.get(document.doc_type, document.doc_type)} "
+            f"№ {document.number}: {len(links)}. "
+            "Файл хранится в архиве один раз (ТЗ п.49)."
+        )
+        self.links_table.setRowCount(len(links))
+        for row, link in enumerate(links):
+            archive_document = link.archive_document
+            values = [
+                archive_document.original_name if archive_document else "—",
+                archive_document.category if archive_document else "—",
+                link.link_role,
+                str(link.archive_version.version_no)
+                if link.archive_version else "—",
+            ]
+            for column, value in enumerate(values):
+                self.links_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _selected_document_quiet(self):
+        """Выбранный документ или None без показания сообщений."""
+        row = self.documents_table.currentRow()
+        documents = document_service.list_documents(self.db, self.project_id)
+        if row < 0 or row >= len(documents):
+            return None
+        return documents[row]
+
+    def add_link(self) -> None:
+        """Связать выбранный документ с файлом архива (ТЗ п.45, 47, 48)."""
+        from app.ui.material_dialog import LinkDialog
+
+        document = self._selected_document()
+        if document is None:
+            return
+        dialog = LinkDialog(self.db, self.project_id, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            link = link_service.link_document_to_archive(
+                self.db, document_id=document.id, **dialog.values()
+            )
+        except link_service.MaterialError as exc:
+            QMessageBox.warning(self, "Связь не создана", str(exc))
+            return
+        service.record_event(
+            self.db, self.project_id, "document_linked",
+            f"К документу № {document.number} привязан файл "
+            f"{link.archive_document.original_name if link.archive_document else '—'}",
+            entity_type="document", entity_id=document.id,
+        )
+        self.db.commit()
+        self._reload_links()
+        self._load_summary(service.get_project(self.db, self.project_id))
+
+    def delete_link(self) -> None:
+        """Удалить связь, сохранив архивный документ (ТЗ п.52)."""
+        row = self.links_table.currentRow()
+        document = self._selected_document_quiet()
+        if document is None or row < 0:
+            QMessageBox.information(
+                self, "Выберите связь", "Сначала выберите документ и связь в перечне."
+            )
+            return
+        links = link_service.list_document_links(self.db, document.id)
+        if row >= len(links):
+            return
+        link = links[row]
+        name = link.archive_document.original_name if link.archive_document else "?"
+        answer = QMessageBox.question(
+            self, "Удаление связи",
+            f"Удалить связь с файлом «{name}»? Файл останется в архиве (ТЗ п.52).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        link_service.unlink_document_from_archive(self.db, link.id)
+        self._reload_links()
+        self._load_summary(service.get_project(self.db, self.project_id))
 
     def add_section(self) -> None:
         kinds = self.db.query(SectionKind).order_by(SectionKind.code).all()
@@ -557,6 +764,15 @@ class ProjectWindow(QWidget):
             QMessageBox.warning(self, "Удаление невозможно", str(exc))
             return
         self._load_sections(service.get_project(self.db, self.project_id))
+
+
+def _quantity_label(quantity: float | None) -> str:
+    """Количество материала без лишних нулей после запятой."""
+    if quantity is None:
+        return "—"
+    if float(quantity).is_integer():
+        return str(int(quantity))
+    return f"{quantity:.3f}".rstrip("0").rstrip(".")
 
 
 def _status_label(status: str | None) -> str:
