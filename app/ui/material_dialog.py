@@ -180,6 +180,9 @@ class MaterialActsDialog(QDialog):
         already = {
             act.id for act in link_service.list_test_acts_of_material(db, material.id)
         }
+        # Уже указанные акты показываются, но повторно не предлагаются:
+        # иначе подтверждение окна приводило бы к отказу сервиса (ТЗ п.45).
+        self.already_linked = already
         acts = link_service.project_test_acts(db, project_id)
         self.acts_list = QListWidget()
         for act in acts:
@@ -213,11 +216,13 @@ class MaterialActsDialog(QDialog):
         layout.addWidget(self.buttons)
 
     def selected_acts(self) -> list[int]:
-        """Акты, отмеченные оператором."""
+        """Акты, отмеченные оператором (без уже связанных)."""
         from PyQt6.QtCore import Qt
 
         return [
             self.acts_list.item(row).data(Qt.ItemDataRole.UserRole)
             for row in range(self.acts_list.count())
             if self.acts_list.item(row).checkState() == Qt.CheckState.Checked
+            and self.acts_list.item(row).data(Qt.ItemDataRole.UserRole)
+            not in self.already_linked
         ]
