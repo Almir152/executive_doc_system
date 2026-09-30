@@ -4,7 +4,7 @@ import time
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import close_all_sessions, declarative_base, sessionmaker
 
 from app.config import DB_PATH, ensure_dirs
 
@@ -176,6 +176,17 @@ def init_db() -> dict:
         "journal_ok": journal_ok,
         "journal_mode": journal_mode(),
     }
+
+
+def release_database() -> None:
+    """Освободить соединения с рабочей базой (ТЗ п.54, 98).
+
+    Нужно перед восстановлением из резервной копии: файл базы подменяется
+    целиком, и держать открытым соединение с прежним содержимым нельзя.
+    После восстановления программа перезапускается.
+    """
+    close_all_sessions()
+    engine.dispose()
 
 
 def check_integrity() -> list:

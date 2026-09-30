@@ -9,12 +9,12 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCloseEvent
 
-from app.config import ARCHIVE_DIR, DATA_DIR, PACKAGES_DIR, ensure_dirs
+from app.config import ARCHIVE_DIR, BACKUP_DIR, DATA_DIR, PACKAGES_DIR, ensure_dirs
 from app.core import domain
-from app.db.database import SessionLocal, init_db
+from app.db.database import SessionLocal, init_db, release_database
 from app.db.models import Direction, Project, Document
 from app.ai.connector import AIConnector, MODE_LABELS, MODE_ORDER
-from app.core.services import storage_service
+from app.core.services import backup_service, storage_service
 from app.core.services.storage_service import (
     ARCHIVE_CATEGORIES, ARCHIVE_CATEGORY_DEFAULT, StorageError, add_file_to_archive,
     calculate_hash, find_by_hash,
@@ -54,6 +54,7 @@ class MainWindow(QMainWindow):
         self.base_dir = str(DATA_DIR)
         self.archive_dir = str(ARCHIVE_DIR)
         self.export_dir = str(PACKAGES_DIR)
+        self.backup_dir = str(BACKUP_DIR)
 
         # База данных и ИИ
         init_db()
@@ -71,6 +72,7 @@ class MainWindow(QMainWindow):
         self.load_archive_files()
         self.load_forms()
         self.load_norms()
+        self.load_backups()
 
     def init_ui(self):
         main_widget = QWidget()
@@ -286,7 +288,45 @@ class MainWindow(QMainWindow):
         #Backup-функция (раздел Этап 6) и просмотр путей.
         form_storage.addRow("Внутренний архив:", QLabel(os.path.normpath(self.archive_dir)))
         form_storage.addRow("Папка комплектов:", QLabel(os.path.normpath(self.export_dir)))
+        form_storage.addRow("Резервные копии:", QLabel(os.path.normpath(self.backup_dir)))
         layout.addWidget(group_storage)
+
+        # ТЗ п.74, 98: копия проекта — отдельная сущность, а не комплект.
+        group_backup = QGroupBox("Резервное копирование проекта (ТЗ п.74, 98)")
+        backup_layout = QVBoxLayout(group_backup)
+        backup_hint = QLabel(
+            "Копия содержит базу, файлы архива, связи, версии, историю и "
+            "настройки. Восстановление на другом компьютере возвращает проект "
+            "в рабочее состояние."
+        )
+        backup_hint.setWordWrap(True)
+        backup_layout.addWidget(backup_hint)
+
+        buttons = QHBoxLayout()
+        self.btn_create_backup = QPushButton("Создать резервную копию")
+        self.btn_create_backup.clicked.connect(self.create_backup_action)
+        buttons.addWidget(self.btn_create_backup)
+
+        self.btn_restore_backup = QPushButton("Восстановить из копии…")
+        self.btn_restore_backup.clicked.connect(self.restore_backup_action)
+        buttons.addWidget(self.btn_restore_backup)
+        backup_layout.addLayout(buttons)
+
+        self.backup_list = QTableWidget(0, 3)
+        self.backup_list.setHorizontalHeaderLabels(
+            ["Копия", "Создана", "Проектов / документов"]
+        )
+        self.backup_list.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch
+        )
+        self.backup_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.backup_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        backup_layout.addWidget(self.backup_list)
+
+        refresh = QPushButton("Обновить список копий")
+        refresh.clicked.connect(self.load_backups)
+        backup_layout.addWidget(refresh)
+        layout.addWidget(group_backup)
 
         group_ai = QGroupBox("Параметры ИИ")
         form_ai = QFormLayout(group_ai)
@@ -730,6 +770,115 @@ class MainWindow(QMainWindow):
             else:
                 out += f"• {p}\n"
         self.ai_output.setText(out)
+
+    # -----------------------------------------------------------------
+    # РЕЗЕРВНОЕ КОПИРОВАНИЕ (ТЗ п.74, 98)
+    # -----------------------------------------------------------------
+
+    def load_backups(self):
+        """Показать имеющиеся копии: свежие сверху (ТЗ п.74)."""
+        self.backup_list.setRowCount(0)
+        for item in backup_service.list_backups(BACKUP_DIR):
+            counts = item.get("counts", {})
+            row = self.backup_list.rowCount()
+            self.backup_list.insertRow(row)
+            self.backup_list.setItem(row, 0, QTableWidgetItem(item["name"]))
+            self.backup_list.setItem(
+                row, 1, QTableWidgetItem(item["created_at"].strftime("%d.%m.%Y %H:%M"))
+            )
+            self.backup_list.setItem(row, 2, QTableWidgetItem(
+                f"{counts.get('projects', 0)} / {counts.get('documents', 0)}"
+            ))
+
+    def create_backup_action(self):
+        """Создать копию проекта: база, файлы, настройки (ТЗ п.74, 98).
+
+        Несохранённые правки не коммитятся молча: сервис их отклонит, чтобы
+        копия не разошлась с тем, что оператор видит (ТЗ п.86, 98).
+        """
+        try:
+            folder = backup_service.create_backup(self.db)
+        except backup_service.BackupError as exc:
+            QMessageBox.critical(self, "Резервная копия", str(exc))
+            return
+        self.load_backups()
+        problems = backup_service.verify_backup(folder)
+        text = backup_service.describe_backup(folder)
+        if problems:
+            QMessageBox.warning(
+                self,
+                "Резервная копия",
+                text + "\n\nКопия создана, но проверка нашла замечания:\n"
+                + "\n".join(f"• {problem}" for problem in problems),
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Резервная копия",
+                text + "\n\nКопия создана и проверена.\n"
+                f"Папка: {folder}",
+            )
+
+    def restore_backup_action(self):
+        """Восстановить проект из копии (ТЗ п.98).
+
+        Восстановление подменяет файл базы, поэтому соединения с ней
+        освобождаются, а оператору предлагается перезапустить программу:
+        открытые списки и окно проекта показывали бы прежние данные.
+        """
+        if self.project_window is not None:
+            self.project_window.close()
+            self.project_window = None
+        folder = QFileDialog.getExistingDirectory(
+            self, "Папка резервной копии", str(BACKUP_DIR)
+        )
+        if not folder:
+            return
+        try:
+            problems = backup_service.verify_backup(folder)
+        except backup_service.BackupError as exc:
+            problems = [str(exc)]
+        if problems:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Копия не пригодна для восстановления")
+            box.setText(
+                "Восстановление невозможно, рабочие данные не изменены:\n\n"
+                + "\n".join(f"• {problem}" for problem in problems)
+            )
+            box.exec()
+            return
+        answer = QMessageBox.question(
+            self,
+            "Восстановление из копии (ТЗ п.98)",
+            f"Восстановить проект из копии\n{folder}?\n\n"
+            "Текущие данные будут отложены в папку копий, чтобы восстановление\n"
+            "можно было отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            release_database()
+            safety = backup_service.restore_backup(folder)
+        except backup_service.BackupError as exc:
+            self.db = SessionLocal()
+            QMessageBox.critical(
+                self,
+                "Восстановление не выполнено",
+                f"{exc}\n\nРабочие данные не изменены.",
+            )
+            return
+        self.db = SessionLocal()
+        self.load_backups()
+        QMessageBox.information(
+            self,
+            "Восстановление выполнено",
+            f"Проект восстановлен из копии {Path(folder).name}.\n"
+            f"Прежние данные отложены: {safety}\n\n"
+            "Перезапустите программу, чтобы увидеть восстановленные данные.",
+        )
 
     def closeEvent(self, event: QCloseEvent):
         """Безопасно закрываем подключение к SQLite при выходе (важно для Windows)"""
