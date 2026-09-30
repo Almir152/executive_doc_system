@@ -185,7 +185,27 @@ def test_dialog_marks_linked_acts(db, material, test_act, qapp):
     item = dialog.acts_list.item(0)
     assert item.checkState() == Qt.CheckState.Checked
     assert "уже указан" in item.text()
-    assert dialog.selected_acts() == [test_act.id]
+    assert dialog.selected_acts() == [], "повторно предлагать нечего"
+
+
+@pytest.mark.gui
+def test_dialog_returns_only_new_acts(db, material, test_act, qapp, project):
+    """В выбранные попадают только новые акты (ТЗ п.45)."""
+    from PyQt6.QtCore import Qt
+
+    from app.core.services import document_service
+    from app.ui.material_dialog import MaterialActsDialog
+
+    link_service.link_material_to_test_act(db, material.id, test_act.id)
+    second = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_TEST_ACT, number="2"
+    )
+    dialog = MaterialActsDialog(db, material.project_id, material)
+    for row in range(dialog.acts_list.count()):
+        item = dialog.acts_list.item(row)
+        if item.data(Qt.ItemDataRole.UserRole) == second.id:
+            item.setCheckState(Qt.CheckState.Checked)
+    assert dialog.selected_acts() == [second.id]
 
 
 @pytest.mark.gui

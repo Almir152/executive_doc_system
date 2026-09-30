@@ -7,9 +7,8 @@
 Проверка идёт в отдельном временном каталоге: рабочее хранилище оператора
 не затрагивается. Своё значение EXECUTIVE_DOC_DATA_DIR скрипт уважает.
 
-Не реализовано и потому не проверяется (см. этапы 2-7):
-построение нормативных форм, полноценная печать PDF, комплекты по ТЗ,
-BACKUP и пользовательский интерфейс справочников.
+Не реализовано и потому не проверяется (см. этапы 6-7):
+обновление через миграции существующей базы и ИИ-контекст по запросу.
 """
 
 import os
@@ -23,8 +22,9 @@ os.environ.setdefault(
     "EXECUTIVE_DOC_DATA_DIR", str(Path(_TMP_DIR.name) / "storage")
 )
 
-from app.config import DATA_DIR, PACKAGES_DIR, ensure_dirs  # noqa: E402
+from app.config import BACKUP_DIR, DATA_DIR, PACKAGES_DIR, ensure_dirs  # noqa: E402
 from app.core import domain  # noqa: E402
+from app.core.services import backup_service  # noqa: E402
 from app.core.services.exporter import export_package  # noqa: E402
 from app.core.services.project_service import (  # noqa: E402
     ProjectError, can_delete_project, delete_project, list_events,
@@ -36,11 +36,37 @@ from app.core.services.storage_service import (  # noqa: E402
 from app.db.database import SessionLocal, check_integrity, get_schema_version, init_db  # noqa: E402
 from app.db.migrations import SCHEMA_VERSION  # noqa: E402
 from app.db.models import (  # noqa: E402
-    ArchiveDocument, Direction, Document, DocumentArchiveLink, DocumentLink,
-    DocumentVersion, MaterialType, Package, PackageEntry, Project,
+    ArchiveDocument, ArchiveFileVersion, Direction, Document, DocumentArchiveLink,
+    DocumentLink, DocumentVersion, MaterialType, Package, PackageEntry, Project,
 )
 
 FAILURES: list[str] = []
+
+
+def session_at(db_path: Path):
+    """Сессия к чужой базе — как на другом компьютере (ТЗ п.98)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    session = sessionmaker(bind=engine)()
+    return session
+
+
+def integrity_problems(db_path: Path) -> list[str]:
+    """Нарушения целостности чужой базы (ТЗ п.54)."""
+    import sqlite3
+
+    raw = sqlite3.connect(str(db_path))
+    try:
+        problems = []
+        if raw.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            problems.append("база повреждена")
+        if raw.execute("PRAGMA foreign_key_check").fetchall():
+            problems.append("нарушены внешние ключи")
+        return problems
+    finally:
+        raw.close()
 
 
 def check(label: str, condition: bool, detail: str = "") -> None:
@@ -317,6 +343,67 @@ def main() -> int:
           register_event.payload["rows"] >= 1,
           f"строк: {register_event.payload['rows']}")
 
+    # --- Резервная копия, проверка, перенос на другой компьютер (ТЗ п.74, 98) ---
+    backup_root = BACKUP_DIR
+    backup = backup_service.create_backup(db)
+    check("резервная копия создана отдельной папкой (ТЗ п.74, 98)",
+          backup.name.startswith(backup_service.BACKUP_PREFIX)
+          and backup.parent == backup_root,
+          backup.name)
+    manifest = backup_service.read_manifest(backup)
+    counts = manifest["counts"]
+    check("в копии связи, версии и история (ТЗ п.98)",
+          counts["archive_links"] >= 1 and counts["versions"] >= 1
+          and counts["events"] >= 1,
+          f"связей: {counts['archive_links']}, версий: {counts['versions']}, "
+          f"событий: {counts['events']}")
+    check("пользовательские комплекты в копию не попали (ТЗ п.72, 74)",
+          manifest["packages_included"] is False
+          and not list(backup.rglob("packages")))
+    check("свежая копия проходит проверку (ТЗ п.98)",
+          backup_service.verify_backup(backup) == [],
+          backup_service.describe_backup(backup).splitlines()[0])
+
+    # Перенос на другой компьютер: своя база, свой архив, свои настройки.
+    other = Path(_TMP_DIR.name) / "other"
+    other_archive = other / "internal_archive"
+    other_archive.mkdir(parents=True)
+    backup_service.restore_backup(
+        backup, db_path=other / "app.db", archive_dir=other_archive,
+        settings_path=other / "settings.json", safety_dir=backup_root,
+    )
+    check("восстановленная база целостна (ТЗ п.54, 98)",
+          integrity_problems(other / "app.db") == [])
+    other_db = session_at(other / "app.db")
+    try:
+        check("проект вернулся на другой компьютер (ТЗ п.98)",
+              other_db.query(Project).count() == db.query(Project).count() == 1)
+        check("документы и связи вернулись (ТЗ п.98)",
+              other_db.query(Document).count() == db.query(Document).count()
+              and other_db.query(DocumentArchiveLink).count() >= 1)
+        moved = other_db.query(ArchiveFileVersion).all()
+        check("пути файлов переписаны на новый каталог архива (ТЗ п.49, 98)",
+              bool(moved)
+              and all(other_archive.resolve() in Path(v.stored_path).resolve().parents
+                      and Path(v.stored_path).is_file() for v in moved),
+              moved[0].stored_path if moved else "нет файлов")
+    finally:
+        other_db.close()
+
+    # Текущие данные целевой машины откладываются перед восстановлением.
+    safety = backup_service.restore_backup(
+        backup, db_path=other / "app.db", archive_dir=other_archive,
+        settings_path=other / "settings.json", safety_dir=backup_root,
+    )
+    check("прежние данные отложены перед восстановлением (ТЗ п.98)",
+          (safety / "app.db").is_file(), safety.name)
+
+    tampered = next(path for path in (backup / "files").rglob("*") if path.is_file())
+    tampered.write_bytes(b"%PDF-1.4 changed")
+    check("изменённый файл архива обнаруживается проверкой (ТЗ п.98)",
+          any("изменён" in problem
+              for problem in backup_service.verify_backup(backup)))
+
     # --- Удаление проекта не должно унести архив (ТЗ п.54, 109) ---
     allowed, stats = can_delete_project(db, project.id)
     check("проект с архивом удалить нельзя (ТЗ п.109)", not allowed,
@@ -361,7 +448,6 @@ def main() -> int:
     db.close()
 
     print("\n=== НЕ РЕАЛИЗОВАНО ===")
-    print("  - BACKUP, восстановление и перенос (п.74, 98)")
     print("  - обновление через миграции (п.97)")
     print("  - ИИ: контекст по запросу, черновики и подтверждение (п.101-106)")
 
