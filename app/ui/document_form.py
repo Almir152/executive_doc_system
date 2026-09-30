@@ -5,9 +5,9 @@
 """
 
 from PyQt6.QtWidgets import (
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
-    QTextEdit, QVBoxLayout, QWidget,
+    QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton,
+    QScrollArea, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from app.core import domain
@@ -100,6 +100,65 @@ class ExploitationChoiceWidget(QGroupBox):
         )
 
 
+class FormVersionWidget(QGroupBox):
+    """Выбор версии формы документа (ТЗ п.24, 62, 96).
+
+    Версия выбирается явно, а не подбирается под объём печати: структура
+    формы не изменяется программой, поэтому полный и краткий варианты
+    существуют как отдельные версии.
+    """
+
+    def __init__(self, db, document_id, on_change=None, parent=None):
+        super().__init__("Версия формы (ТЗ п.96)", parent)
+        self.db = db
+        self.document_id = document_id
+        self.on_change = on_change
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Структура формы не изменяется под печать (ТЗ п.62): полный "
+            "образец и краткий вариант — разные версии. Выбранная версия "
+            "закрепляется за документом и сохраняется при выпуске."
+        ))
+        self.combo = QComboBox()
+        layout.addWidget(self.combo)
+        self.error_label = QLabel()
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+        self.combo.activated.connect(self._activate)
+        self.reload()
+
+    def reload(self) -> None:
+        from app.db.models import Document
+
+        document = self.db.get(Document, self.document_id)
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        if document is None:
+            self.combo.blockSignals(False)
+            return
+        forms = form_service.available_versions(self.db, document.doc_type)
+        # Закреплённой версии нет — действует актуальная (ТЗ п.96).
+        selected = document.form_version_id
+        if selected is None:
+            selected = next((f.id for f in forms if f.is_current), None)
+        for form in forms:
+            mark = " — актуальная" if form.is_current else ""
+            self.combo.addItem(f"v{form.version}: {form.title}{mark}", form.id)
+            if form.id == selected:
+                self.combo.setCurrentIndex(self.combo.count() - 1)
+        if self.combo.currentIndex() < 0 and self.combo.count():
+            self.combo.setCurrentIndex(0)
+        self.combo.blockSignals(False)
+        self.setEnabled(document.status != domain.DOC_STATUS_ISSUED)
+
+    def _activate(self, index: int) -> None:
+        version_id = self.combo.itemData(index)
+        error = form_service.pin_form_version(self.db, self.document_id, version_id)
+        self.error_label.setText(error)
+        if not error and self.on_change is not None:
+            self.on_change()
+
+
 class DocumentFormPanel(QWidget):
     """Панель формы документа: поля, подписанты, черновик."""
 
@@ -131,6 +190,11 @@ class DocumentFormPanel(QWidget):
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         outer.addWidget(self.status_label)
+
+        self.form_version = FormVersionWidget(
+            self.db, self.document_id, on_change=self.reload
+        )
+        outer.addWidget(self.form_version)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -187,6 +251,7 @@ class DocumentFormPanel(QWidget):
         self.status_label.setText(
             f"{date_text}   •   статус: {_status_label(document.status)}"
         )
+        self.form_version.reload()
 
         payload = form_service.load_draft(self.db, self.document_id)
         while self.fields_form.count():

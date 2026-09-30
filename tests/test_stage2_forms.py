@@ -24,7 +24,9 @@ from app.core.forms import (
     NormativeFormDefinition,
     validate_against_spec,
 )
-from app.db.form_definitions import FORM_DEFINITIONS
+from app.db.form_definitions import (
+    FORM_DEFINITIONS, FORM_VERSION_AOSR_OFFICIAL, FORM_VERSION_AOSR_SHORT,
+)
 from app.db.forms_service import (
     current_form,
     form_by_version,
@@ -376,14 +378,14 @@ def test_loading_is_idempotent(db):
     assert report["created"] == []
     assert report["skipped"] == []
     count = db.execute(text("SELECT count(*) FROM normative_forms")).scalar()
-    assert count == len(RAW)
+    assert count == len(FORM_DEFINITIONS)
 
 
 def test_loading_twice_reports_no_conflict(db):
     """Одно и то же описание не считается конфликтом версий."""
     load_form_definitions(db)
     report = load_form_definitions(db)
-    assert len(report["unchanged"]) == len(RAW)
+    assert len(report["unchanged"]) == len(FORM_DEFINITIONS)
 
 
 def test_changed_form_requires_new_version(db):
@@ -443,8 +445,12 @@ def test_form_violating_specification_is_not_saved(db):
 def test_only_one_current_version_per_document_type(db):
     """Для типа документа актуальна ровно одна версия формы."""
     load_form_definitions(db)
-    first = RAW[domain.DOC_TYPE_AOSR]["version"]
-    for version in (first + 1, first + 2):
+    shipped = sorted(
+        d["version"] for d in FORM_DEFINITIONS
+        if d["doc_type"] == domain.DOC_TYPE_AOSR
+    )
+    last = shipped[-1]
+    for version in (last + 1, last + 2):
         nxt = copy.deepcopy(RAW[domain.DOC_TYPE_AOSR])
         nxt["version"] = version
         load_form_definitions(db, [nxt])
@@ -453,8 +459,8 @@ def test_only_one_current_version_per_document_type(db):
         text("SELECT version, is_current FROM normative_forms "
              "WHERE doc_type = :d ORDER BY version"),
         {"d": domain.DOC_TYPE_AOSR}).all()
-    assert [r[0] for r in rows] == [first, first + 1, first + 2]
-    assert [r[0] for r in rows if r[1]] == [first + 2]
+    assert [r[0] for r in rows] == shipped + [last + 1, last + 2]
+    assert [r[0] for r in rows if r[1]] == [last + 2]
 
 
 def test_form_in_use_cannot_be_deleted(db):
@@ -496,3 +502,94 @@ def test_saved_definition_round_trips_through_json(db):
     for doc_type in domain.NUMBERED_DOC_TYPES:
         form = current_form(db, doc_type)
         assert parse_form(form) == _definition(doc_type), doc_type
+
+
+# =====================================================================
+# АОСР по рекомендуемому образцу (ТЗ п.24, 62, 96)
+# =====================================================================
+
+
+def _aosr_raw(version: int) -> dict:
+    for raw in FORM_DEFINITIONS:
+        if raw["doc_type"] == domain.DOC_TYPE_AOSR and raw["version"] == version:
+            return raw
+    raise AssertionError(f"в определениях нет АОСР версии {version}")
+
+
+def _definition_by_version(version: int) -> NormativeFormDefinition:
+    return NormativeFormDefinition.from_dict(_aosr_raw(version))
+
+
+def _section_of(definition: NormativeFormDefinition, number: int):
+    for section in definition.sections:
+        if section.number == number:
+            return section
+    raise AssertionError(f"в форме нет раздела {number}")
+
+
+def test_aosr_official_sample_is_offered_as_separate_versions():
+    """Образец приказа и краткий вариант оформлены версиями, а не флагом.
+
+    П.62 запрещает менять структуру формы ради удобства печати, поэтому
+    оба варианта существуют как отдельные версии одной формы (п.96).
+    """
+    official = _definition_by_version(FORM_VERSION_AOSR_OFFICIAL)
+    short = _definition_by_version(FORM_VERSION_AOSR_SHORT)
+    assert official.version < short.version
+    for definition in (official, short):
+        assert validate_against_spec(definition) == [], definition.version
+    assert official.to_dict() != short.to_dict()
+
+
+def test_official_sample_reproduces_rekvizity_of_participants():
+    """В шапке полного образца реквизиты участников перечислены дословно."""
+    header = _section_of(_definition_by_version(FORM_VERSION_AOSR_OFFICIAL), 2)
+    assert header.title == "Сведения об участниках (шапка акта)"
+    keys = [b.key for b in header.blocks]
+    assert keys == ["customer_requisites", "contractor_requisites",
+                    "designer_requisites"]
+    customer, contractor, designer = header.blocks
+    assert customer.required and contractor.required
+    assert not designer.required, "проектировщик указывается в случае привлечения"
+    for block in (customer, contractor):
+        assert "ОГРН" in block.note and "ИНН" in block.note
+        assert "саморегулируемой организации" in block.note
+    assert "архитектурно-строительного проектирования" in designer.note
+
+
+def test_official_sample_keeps_wording_of_the_order():
+    """Формулировки образца перенесены в подписи и заголовок разделов."""
+    definition = _definition_by_version(FORM_VERSION_AOSR_OFFICIAL)
+    conclusion = _section_of(definition, 9)
+    assert conclusion.title == "Разрешается производство последующих работ"
+    assert "инженерно-технического обеспечения" in conclusion.blocks[0].label
+    assert "№ 369/пр" in definition.basis
+
+
+def test_official_sample_adds_designer_signature_and_attachments():
+    """В образце подписывает проектировщик, к акту прилагаются документы."""
+    definition = _definition_by_version(FORM_VERSION_AOSR_OFFICIAL)
+    signatures = _section_of(definition, 10)
+    assert "designer_rep" in {b.key for b in signatures.blocks}
+    attachments = definition.field("attachments")
+    assert attachments.kind == BLOCK_DOCUMENT_LIST
+    assert attachments.threshold == 5
+    assert definition.field("project_docs").required
+
+
+def test_short_variant_prints_two_pages_and_keeps_tz_requirements():
+    """Краткий вариант — актуальная печатная форма на две страницы (ТЗ п.56)."""
+    short = _definition_by_version(FORM_VERSION_AOSR_SHORT)
+    assert short.layout.target_pages == "2"
+    assert not short.field("nrs").required
+    assert short.field("work_performer").required
+    keys = {b.key for section in short.sections for b in section.blocks}
+    assert "attachments" not in keys
+    assert "customer_requisites" not in keys
+
+
+def test_full_official_sample_targets_more_pages_than_short_one():
+    """Полный образец с реквизитами не умещается в целевые две страницы."""
+    official = _definition_by_version(FORM_VERSION_AOSR_OFFICIAL)
+    short = _definition_by_version(FORM_VERSION_AOSR_SHORT)
+    assert official.layout.target_pages != short.layout.target_pages

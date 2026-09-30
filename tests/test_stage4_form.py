@@ -129,7 +129,8 @@ def test_whitespace_does_not_count_as_filled(db, aosr):
 def test_form_without_description_cannot_be_issued(db, project):
     """Без описания формы неизвестно, что заполнено (ТЗ п.96)."""
     form = db.query(NormativeForm).filter(
-        NormativeForm.doc_type == domain.DOC_TYPE_AOSR
+        NormativeForm.doc_type == domain.DOC_TYPE_AOSR,
+        NormativeForm.is_current.is_(True),
     ).one()
     form.definition = None
     db.commit()
@@ -144,7 +145,8 @@ def test_form_without_description_cannot_be_issued(db, project):
 def test_pinned_form_version_is_used(db, aosr):
     """Документ проверяется по той форме, по которой он заполняется (ТЗ п.96)."""
     form = db.query(NormativeForm).filter(
-        NormativeForm.doc_type == domain.DOC_TYPE_AOSR
+        NormativeForm.doc_type == domain.DOC_TYPE_AOSR,
+        NormativeForm.is_current.is_(True),
     ).one()
     definition = dict(form.definition)
     definition["sections"] = [

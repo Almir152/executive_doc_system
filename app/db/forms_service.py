@@ -80,6 +80,11 @@ def load_form_definitions(session: Session, definitions=FORM_DEFINITIONS) -> dic
                 definition=definition.to_dict(),
             )
             session.add(form)
+            # Сессия создана без автосброса, поэтому новая версия должна
+            # попасть в таблицу до снятия признака с прежних: иначе при
+            # нескольких версиях одного типа документа актуальными останутся
+            # сразу все загруженные (ТЗ п.96).
+            session.flush()
             # Только одна версия типа документа считается актуальной.
             session.execute(
                 NormativeForm.__table__.update()

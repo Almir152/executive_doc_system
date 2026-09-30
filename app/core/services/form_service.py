@@ -141,6 +141,46 @@ def actual_payload(db: Session, document_id: int) -> dict:
     return dict(version.payload) if version is not None else {}
 
 
+def available_versions(db: Session, doc_type: str) -> list[NormativeForm]:
+    """Все версии формы типа документа, свежая первой (ТЗ п.96).
+
+    Нужен панели формы документа: версия выбирается явно, потому что
+    структура формы не изменяется под печать (ТЗ п.62), а различается
+    только версией.
+    """
+    return list(
+        db.scalars(
+            select(NormativeForm)
+            .where(NormativeForm.doc_type == doc_type)
+            .order_by(NormativeForm.version.desc())
+        )
+    )
+
+
+def pin_form_version(db: Session, document_id: int, version_id: int | None) -> str:
+    """Закрепить за документом версию формы (ТЗ п.96).
+
+    ``None`` возвращает документ к актуальной версии справочника.
+    Выпущенный документ закреплённую версию не меняет: иначе уже
+    зафиксированное содержимое перестало бы соответствовать форме, по
+    которой оно составлено.
+    """
+    document = db.get(Document, document_id)
+    if document is None:
+        raise ValueError("документ не найден")
+    if document.status == domain.DOC_STATUS_ISSUED:
+        return "документ выпущен: версия формы зафиксирована (ТЗ п.96)"
+    if version_id is not None:
+        form = db.get(NormativeForm, version_id)
+        if form is None or form.doc_type != document.doc_type:
+            return "выбранная версия относится к другому типу документа"
+        document.form_version_id = version_id
+    else:
+        document.form_version_id = None
+    db.commit()
+    return ""
+
+
 def current_definition(db: Session, document: Document) -> dict | None:
     """Описание формы документа: закреплённое или текущее (ТЗ п.96).
 

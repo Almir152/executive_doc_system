@@ -9,7 +9,10 @@ from PyQt6.QtWidgets import QMessageBox, QPushButton
 
 from app.core import domain
 from app.core.services import document_service, form_service, project_service
-from app.db.models import SectionKind
+from app.db.form_definitions import (
+    FORM_VERSION_AOSR_OFFICIAL, FORM_VERSION_AOSR_SHORT,
+)
+from app.db.models import NormativeForm, SectionKind
 from app.ui.document_form import (
     DocumentFormPanel, ExploitationChoiceWidget, SignatureBlocksWidget,
 )
@@ -531,3 +534,78 @@ def test_switching_document_prompts_before_replacing_form(
 
     assert window.form_panel.document_id == first.id
     window.close()
+
+
+# =====================================================================
+# Выбор версии формы (ТЗ п.24, 62, 96)
+# =====================================================================
+
+
+def test_form_panel_offers_all_versions_of_the_form(db, project):
+    """Оператор выбирает версию формы явно: обе версии доступны."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR
+    )
+    panel = DocumentFormPanel(db, document.id)
+
+    combo = panel.form_version.combo
+    assert combo.count() >= 2, "в справочнике обе версии формы"
+    # По умолчанию выбрана актуальная — краткая печатная (ТЗ п.56).
+    assert f"v{FORM_VERSION_AOSR_SHORT}:" in combo.currentText()
+    assert "— актуальная" in combo.currentText()
+
+    full = next(
+        i for i in range(combo.count())
+        if f"v{FORM_VERSION_AOSR_OFFICIAL}:" in combo.itemText(i)
+    )
+    combo.setCurrentIndex(full)
+    combo.activated.emit(full)
+
+    db.refresh(document)
+    assert document.form_version_id == combo.itemData(full)
+    assert document.form_version.version == FORM_VERSION_AOSR_OFFICIAL
+    panel.deleteLater()
+
+
+def test_switching_version_rebuilds_fields_of_that_version(db, project):
+    """В форме появляются поля той версии, которая выбрана."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR
+    )
+    panel = DocumentFormPanel(db, document.id)
+    assert "customer_requisites" not in panel.field_edits
+
+    combo = panel.form_version.combo
+    index = next(
+        i for i in range(combo.count())
+        if f"v{FORM_VERSION_AOSR_OFFICIAL}:" in combo.itemText(i)
+    )
+    combo.setCurrentIndex(index)
+    combo.activated.emit(index)
+
+    assert "customer_requisites" in panel.field_edits
+    assert "attachments" in panel.field_edits
+    panel.deleteLater()
+
+
+def test_released_document_keeps_its_form_version(db, project):
+    """Выпущенный документ версию формы не меняет (ТЗ п.96)."""
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR
+    )
+    issued = db.query(NormativeForm).filter(
+        NormativeForm.doc_type == domain.DOC_TYPE_AOSR,
+        NormativeForm.version == FORM_VERSION_AOSR_OFFICIAL,
+    ).one()
+    document.form_version_id = issued.id
+    document.status = domain.DOC_STATUS_ISSUED
+    db.commit()
+
+    panel = DocumentFormPanel(db, document.id)
+    assert not panel.form_version.isEnabled()
+
+    error = form_service.pin_form_version(db, document.id, None)
+    assert "зафиксирована" in error
+    db.refresh(document)
+    assert document.form_version_id == issued.id
+    panel.deleteLater()
