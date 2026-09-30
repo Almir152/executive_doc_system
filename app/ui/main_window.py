@@ -18,7 +18,8 @@ from app.core.services.storage_service import (
     ARCHIVE_CATEGORIES, ARCHIVE_CATEGORY_DEFAULT, StorageError, add_file_to_archive,
     calculate_hash, find_by_hash,
 )
-from app.core.services.exporter import export_package
+from app.core.services.export_checks import check_package
+from app.core.services.exporter import export_package, write_errors_file
 from app.ui.directories_page import DirectoryPage
 from app.ui.project_window import ProjectWindow
 from app.core.services.project_service import (
@@ -573,13 +574,49 @@ class MainWindow(QMainWindow):
         if project_id is None:
             QMessageBox.warning(self, "Ошибка", "Выберите проект!")
             return
+
+        # ТЗ п.82: комплект проверяется до выгрузки, а не после.
+        result = check_package(self.db, project_id)
+        if result.has_errors and not self._confirm_export_with_errors(result):
+            return
+
         target_dir = QFileDialog.getExistingDirectory(self, "Папка для выгрузки")
-        if not target_dir: return
+        if not target_dir:
+            return
         try:
             out_path = export_package(self.db, project_id, target_dir)
+            if result.has_errors:
+                errors_path = write_errors_file(out_path, result)
+                QMessageBox.information(
+                    self, "Выгружено с ошибками",
+                    f"Комплект выгружен:\n{os.path.normpath(out_path)}\n\n"
+                    f"Проблемы записаны в файл:\n{os.path.normpath(str(errors_path))}",
+                )
+                return
             QMessageBox.information(self, "Успех", f"Пакет выгружен:\n{os.path.normpath(out_path)}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
+
+    def _confirm_export_with_errors(self, result) -> bool:
+        """Показать проблемы комплекта и спросить, выгружать ли всё равно.
+
+        ТЗ п.83: при выборе «всё равно завершить» в папке выгрузки создаётся
+        `Ошибки выгрузки.txt`; отказ отменяет выгрузку целиком.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Проверка комплекта (ТЗ п.82)")
+        box.setText(
+            "Обнаружены проблемы комплекта:\n\n"
+            + "\n".join(f"• {problem}" for problem in result.problems[:20])
+            + ("\n…" if len(result.problems) > 20 else "")
+        )
+        finish = box.addButton(
+            "Всё равно завершить", QMessageBox.ButtonRole.AcceptRole
+        )
+        box.addButton("Отменить выгрузку", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is finish
 
     def run_ai_check(self):
         if not self.ai.enabled:

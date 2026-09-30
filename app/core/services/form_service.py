@@ -111,6 +111,31 @@ def _draft_version(db: Session, document_id: int) -> DocumentVersion | None:
     )
 
 
+def actual_version(db: Session, document_id: int) -> DocumentVersion | None:
+    """Версия документа, которая попадёт в комплект (ТЗ п.93).
+
+    У выпущенного документа — зафиксированная версия, у рабочего —
+    черновик. Проверки перед выгрузкой (ТЗ п.82) должны смотреть именно на
+    неё: выгружается зафиксированное содержимое, а не то, что оператор
+    правит сейчас.
+    """
+    issued = db.scalar(
+        select(DocumentVersion)
+        .where(
+            DocumentVersion.document_id == document_id,
+            DocumentVersion.issued_at.is_not(None),
+        )
+        .order_by(DocumentVersion.version_no.desc())
+    )
+    return issued if issued is not None else _draft_version(db, document_id)
+
+
+def actual_payload(db: Session, document_id: int) -> dict:
+    """Содержимое документа, подлежащее выгрузке (ТЗ п.82, 93)."""
+    version = actual_version(db, document_id)
+    return dict(version.payload) if version is not None else {}
+
+
 def current_definition(db: Session, document: Document) -> dict | None:
     """Описание формы документа: закреплённое или текущее (ТЗ п.96).
 
