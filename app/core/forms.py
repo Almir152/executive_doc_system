@@ -55,10 +55,13 @@ SOURCE_MANUAL = "manual"
 SOURCE_REPRESENTATIVE = "representative"
 SOURCE_DOCUMENT = "document"
 SOURCE_LINKED = "linked"
+# Разделы проектной документации: оператор выбирает один или несколько
+# разделов там, где это предусмотрено формой (ТЗ п.21).
+SOURCE_SECTION = "section"
 
 FIELD_SOURCES = frozenset({
     SOURCE_PROJECT, SOURCE_MANUAL, SOURCE_REPRESENTATIVE,
-    SOURCE_DOCUMENT, SOURCE_LINKED,
+    SOURCE_DOCUMENT, SOURCE_LINKED, SOURCE_SECTION,
 })
 
 # --------------------------------------------------------------------------
@@ -191,6 +194,10 @@ class FormField:
         kind = data.get("kind", BLOCK_FIELD)
         if kind not in BLOCK_KINDS:
             raise FormDefinitionError(f"неизвестный вид блока {kind!r}")
+        if data.get("source", SOURCE_MANUAL) not in FIELD_SOURCES:
+            raise FormDefinitionError(
+                f"неизвестный источник значения {data['source']!r}"
+            )
         if kind == BLOCK_FIXED_TEXT and not data.get("text"):
             raise FormDefinitionError(
                 f"неизменяемая формулировка {data.get('key')!r} должна содержать текст"

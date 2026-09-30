@@ -30,9 +30,13 @@ from app.core.forms import (
     SOURCE_MANUAL,
     SOURCE_PROJECT,
     SOURCE_REPRESENTATIVE,
+    SOURCE_SECTION,
 )
 
 FORM_VERSION = 1
+
+# АОСР: версия 2 — в пункте 3 появился выбор разделов проекта (ТЗ п.21).
+FORM_VERSION_SECTIONS = 2
 
 # АОУСИТО и акты испытаний: версия 2. В версии 1 не было указания, что
 # незаполненный блок представителя эксплуатации можно убрать из печати, —
@@ -53,7 +57,7 @@ ROLE_EXPLOITATION = "exploitation"
 _AOSR: dict = {
     "schema": DEFINITION_SCHEMA,
     "doc_type": domain.DOC_TYPE_AOSR,
-    "version": FORM_VERSION,
+    "version": FORM_VERSION_SECTIONS,
     "title": "Акт освидетельствования скрытых работ",
     "basis": "приказ Минстроя России № 344/пр (ТЗ п.24)",
     "layout": {
@@ -90,7 +94,8 @@ _AOSR: dict = {
                  "source": SOURCE_MANUAL, "required": True},
                 {"key": "section_refs",
                  "label": "Номера разделов проекта, к которым относятся работы",
-                 "source": SOURCE_MANUAL, "required": True},
+                 "source": SOURCE_SECTION, "required": True,
+                 "note": "оператор выбирает один или несколько разделов (ТЗ п.21)"},
                 {"key": "work_period",
                  "label": "Период выполнения работ (с ... по ...)",
                  "source": SOURCE_MANUAL, "required": True},

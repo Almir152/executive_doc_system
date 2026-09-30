@@ -389,6 +389,7 @@ def test_loading_twice_reports_no_conflict(db):
 def test_changed_form_requires_new_version(db):
     """П.96: изменение формы создаёт новую версию, а не перезаписывает старую."""
     load_form_definitions(db)
+    base = RAW[domain.DOC_TYPE_AOSR]["version"]
     mutated = copy.deepcopy(RAW[domain.DOC_TYPE_AOSR])
     mutated["sections"][0]["blocks"].append(
         {"key": "extra", "label": "Дополнительное поле"})
@@ -397,24 +398,25 @@ def test_changed_form_requires_new_version(db):
     assert report["created"] == []
     assert report["skipped"], "изменение принято под прежним номером версии"
 
-    v1 = form_by_version(db, domain.DOC_TYPE_AOSR, 1)
-    assert "extra" not in parse_form(v1).section(1).blocks[0].key
-    assert current_form(db, domain.DOC_TYPE_AOSR).version == 1
+    stored = form_by_version(db, domain.DOC_TYPE_AOSR, base)
+    assert "extra" not in parse_form(stored).section(1).blocks[0].key
+    assert current_form(db, domain.DOC_TYPE_AOSR).version == base
 
 
 def test_new_version_becomes_current_and_keeps_previous(db):
     """Новая версия становится актуальной, прежняя остаётся в базе."""
     load_form_definitions(db)
+    previous = RAW[domain.DOC_TYPE_AOSR]["version"]
     v2 = copy.deepcopy(RAW[domain.DOC_TYPE_AOSR])
-    v2["version"] = 2
+    v2["version"] = previous + 1
     v2["sections"][0]["blocks"].append(
         {"key": "extra", "label": "Дополнительное поле"})
 
     report = load_form_definitions(db, [v2])
-    assert report["created"] == ["АОСР v2"]
+    assert report["created"] == [f"АОСР v{previous + 1}"]
 
-    old = form_by_version(db, domain.DOC_TYPE_AOSR, 1)
-    new = form_by_version(db, domain.DOC_TYPE_AOSR, 2)
+    old = form_by_version(db, domain.DOC_TYPE_AOSR, previous)
+    new = form_by_version(db, domain.DOC_TYPE_AOSR, previous + 1)
     assert old is not None and new is not None
     assert old.is_current is False
     assert new.is_current is True
@@ -441,7 +443,8 @@ def test_form_violating_specification_is_not_saved(db):
 def test_only_one_current_version_per_document_type(db):
     """Для типа документа актуальна ровно одна версия формы."""
     load_form_definitions(db)
-    for version in (2, 3):
+    first = RAW[domain.DOC_TYPE_AOSR]["version"]
+    for version in (first + 1, first + 2):
         nxt = copy.deepcopy(RAW[domain.DOC_TYPE_AOSR])
         nxt["version"] = version
         load_form_definitions(db, [nxt])
@@ -450,8 +453,8 @@ def test_only_one_current_version_per_document_type(db):
         text("SELECT version, is_current FROM normative_forms "
              "WHERE doc_type = :d ORDER BY version"),
         {"d": domain.DOC_TYPE_AOSR}).all()
-    assert [r[0] for r in rows] == [1, 2, 3]
-    assert [r[0] for r in rows if r[1]] == [3]
+    assert [r[0] for r in rows] == [first, first + 1, first + 2]
+    assert [r[0] for r in rows if r[1]] == [first + 2]
 
 
 def test_form_in_use_cannot_be_deleted(db):
