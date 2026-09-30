@@ -11,7 +11,11 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core import domain
-from app.core.services import form_service
+from app.core.services import form_service, project_service
+from app.ui.reference_picker import ReferenceMultiPicker
+
+# Признак поля, заполняемого выбором разделов проекта (ТЗ п.21).
+SECTION_SOURCE = "section"
 
 
 class SignatureBlocksWidget(QGroupBox):
@@ -99,10 +103,18 @@ class ExploitationChoiceWidget(QGroupBox):
 class DocumentFormPanel(QWidget):
     """Панель формы документа: поля, подписанты, черновик."""
 
-    def __init__(self, db, document_id, parent=None):
+    def __init__(self, db, document_id, project_id=None, parent=None):
         super().__init__(parent)
         self.db = db
         self.document_id = document_id
+        # Разделы берутся из своего проекта: документ может быть не из того
+        # проекта, который открыт в окне.
+        self.project_id = project_id
+        if self.project_id is None:
+            from app.db.models import Document
+
+            document = db.get(Document, document_id)
+            self.project_id = document.project_id if document is not None else None
         self.field_edits: dict[str, QWidget] = {}
         self.build()
         self.reload()
@@ -183,7 +195,7 @@ class DocumentFormPanel(QWidget):
                 item.widget().deleteLater()
         self.field_edits: dict[str, QWidget] = {}
         for section, field in form_service._iter_fields(self.db, document):
-            edit = _build_editor(field, payload.get(field["key"]))
+            edit = self._build_editor(field, payload.get(field["key"]))
             self.field_edits[field["key"]] = edit
             marker = " *" if field.get("required") else ""
             self.fields_form.addRow(
@@ -199,6 +211,33 @@ class DocumentFormPanel(QWidget):
         self.dirty_label.setText("")
 
     # -----------------------------------------------------------------
+    def _build_editor(self, field: dict, value):
+        """Поле ввода по описанию формы.
+
+        Поле со ссылкой на разделы проектной документации заполняется выбором
+        из структурированных сведений проекта, а не текстом (ТЗ п.21).
+        """
+        if field.get("source") == SECTION_SOURCE:
+            return self._build_section_picker(field, value)
+        return _build_editor(field, value)
+
+    def _build_section_picker(self, field: dict, value):
+        """Выбор одного или нескольких разделов проекта (ТЗ п.21)."""
+        picker = ReferenceMultiPicker()
+        sections = project_service.list_sections(self.db, self.project_id)
+        picker.set_reference_items(
+            [(f"{s.code} — {s.name}", s.code) for s in sections]
+        )
+        if value:
+            picker.set_selected_values(
+                value if isinstance(value, list) else [value]
+            )
+        if not sections:
+            picker.setToolTip(
+                "В проекте нет разделов проектной документации (ТЗ п.21)."
+            )
+        return picker
+
     def payload(self) -> dict:
         """Данные формы из полей ввода.
 
@@ -208,6 +247,12 @@ class DocumentFormPanel(QWidget):
         """
         result = {}
         for key, edit in self.field_edits.items():
+            if isinstance(edit, ReferenceMultiPicker):
+                # Выбор разделов хранится списком кодов (ТЗ п.21).
+                chosen = edit.selected_values()
+                if chosen:
+                    result[key] = chosen
+                continue
             if isinstance(edit, QLineEdit):
                 value = edit.text().strip()
             elif isinstance(edit, QTextEdit):

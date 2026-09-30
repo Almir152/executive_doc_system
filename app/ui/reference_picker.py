@@ -175,6 +175,10 @@ class ReferenceMultiPicker(QWidget):
         self._items = [(str(label), value) for label, value in items]
         self._rebuild()
 
+    def item_count(self) -> int:
+        """Сколько значений есть в справочнике."""
+        return len(self._items)
+
     def _rebuild(self) -> None:
         selected = set(self.selected_values())
         self.list.clear()

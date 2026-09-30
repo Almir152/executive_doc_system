@@ -19,9 +19,10 @@ from app.core import domain
 from app.core.services import document_service, form_service, link_service
 from app.core.services import project_service as service
 from app.db.models import (
-    ArchiveDocument, Document, Organization, Package, SectionKind,
+    ArchiveDocument, Document, Organization, Package,
 )
 from app.ui.document_form import DocumentFormPanel
+from app.ui.section_dialog import SectionDialog, kind_options as db_kinds
 
 _DATA_ROLE = Qt.ItemDataRole.UserRole
 _CHECKABLE = Qt.ItemFlag.ItemIsUserCheckable
@@ -248,6 +249,9 @@ class ProjectWindow(QWidget):
         self.btn_add_section = QPushButton("+ Раздел")
         self.btn_add_section.clicked.connect(self.add_section)
         add_row.addWidget(self.btn_add_section)
+        self.btn_edit_section = QPushButton("Изменить раздел")
+        self.btn_edit_section.clicked.connect(self.edit_section)
+        add_row.addWidget(self.btn_edit_section)
         self.btn_delete_section = QPushButton("Удалить раздел")
         self.btn_delete_section.setStyleSheet(
             "background-color: #ffdddd; color: #990000;"
@@ -696,39 +700,72 @@ class ProjectWindow(QWidget):
         self._load_summary(service.get_project(self.db, self.project_id))
 
     def add_section(self) -> None:
-        kinds = self.db.query(SectionKind).order_by(SectionKind.code).all()
-        if not kinds:
+        """Создать раздел проектной документации (ТЗ п.21)."""
+        if not db_kinds(self.db):
             QMessageBox.warning(
                 self, "Справочник разделов пуст",
                 "Сначала заполните справочник разделов (ТЗ п.22).",
             )
             return
-        kind_names = [k.name for k in kinds]
-        kind_name, ok = QInputDialog.getItem(
-            self, "Новый раздел", "Вид раздела:", kind_names, 0, False
-        )
-        if not ok:
+        dialog = SectionDialog(self.db)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        code, ok = QInputDialog.getText(
-            self, "Новый раздел", "Код раздела (ТЗ п.21):"
-        )
-        if not ok:
-            return
-        name, ok = QInputDialog.getText(
-            self, "Новый раздел", "Наименование раздела:"
-        )
-        if not ok:
-            return
-        kind = next(k for k in kinds if k.name == kind_name)
+        values = dialog.values()
         try:
             service.add_section(
                 self.db, self.project_id,
-                kind_id=kind.id, code=code, name=name,
+                kind_id=values["kind_id"], code=values["code"], name=values["name"],
+                organization_id=values["organization_id"],
+                designer_rep_id=values["designer_rep_id"],
+                sheets=values["sheets"], required_details=values["required_details"],
             )
         except service.ProjectError as exc:
             QMessageBox.warning(self, "Раздел не добавлен", str(exc))
             return
         self._load_sections(service.get_project(self.db, self.project_id))
+
+    def edit_section(self) -> None:
+        """Изменить реквизиты раздела (ТЗ п.21).
+
+        `update_section()` существовал, но был доступен только из кода:
+        оператор не мог исправить раздел, не редактируя базу.
+        """
+        section = self._selected_section()
+        if section is None:
+            return
+        dialog = SectionDialog(self.db, section)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        try:
+            service.update_section(
+                self.db, section.id,
+                name=values["name"], kind_id=values["kind_id"],
+                organization_id=values["organization_id"],
+                designer_rep_id=values["designer_rep_id"],
+                sheets=values["sheets"], required_details=values["required_details"],
+            )
+        except service.ProjectError as exc:
+            QMessageBox.warning(self, "Раздел не изменён", str(exc))
+            return
+        self._load_sections(service.get_project(self.db, self.project_id))
+
+    def _selected_section(self):
+        """Раздел, выбранный в таблице разделов, с пояснением отказа."""
+        row = self.sections_table.currentRow()
+        if row < 0:
+            QMessageBox.information(
+                self, "Выберите раздел", "Сначала выберите раздел в таблице."
+            )
+            return None
+        item = self.sections_table.item(row, 0)
+        return next(
+            (
+                s for s in service.list_sections(self.db, self.project_id)
+                if s.code == item.text()
+            ),
+            None,
+        )
 
     def add_document(self) -> None:
         """Создать документ с предложенным номером (ТЗ п.42).
@@ -886,7 +923,9 @@ class ProjectWindow(QWidget):
 
         if self.form_panel is not None:
             self.form_panel.deleteLater()
-        self.form_panel = DocumentFormPanel(self.db, document.id)
+        self.form_panel = DocumentFormPanel(
+            self.db, document.id, project_id=document.project_id
+        )
         self.form_layout.addWidget(self.form_panel)
         self.form_container.setVisible(True)
         self.btn_close_form.setEnabled(True)
@@ -926,18 +965,7 @@ class ProjectWindow(QWidget):
         return True
 
     def delete_section(self) -> None:
-        row = self.sections_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Удаление раздела", "Выберите раздел.")
-            return
-        item = self.sections_table.item(row, 0)
-        section = next(
-            (
-                s for s in service.list_sections(self.db, self.project_id)
-                if s.code == item.text()
-            ),
-            None,
-        )
+        section = self._selected_section()
         if section is None:
             return
         try:

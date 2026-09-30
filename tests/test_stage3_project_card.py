@@ -5,7 +5,7 @@ import pytest
 from app.core.services import project_service as service
 from app.db.models import (
     Document, DocumentVersion, HistoryEvent, Organization, ProjectSection,
-    SectionKind,
+    Representative, SectionKind,
 )
 
 
@@ -327,19 +327,22 @@ def test_project_window_add_section_through_dialogs(db, project, qapp, monkeypat
     Справочник разделов не имеет поля sort_order: обращение к нему роняло
     окно при первом же добавлении, а сервисные тесты это не ловили.
     """
-    from PyQt6.QtWidgets import QInputDialog
-
+    import app.ui.project_window as project_window
     from app.ui.project_window import ProjectWindow
 
     kind = db.query(SectionKind).first()
-    answers = ["КЖ", "Конструкции железобетонные"]
-    monkeypatch.setattr(
-        QInputDialog, "getItem", staticmethod(lambda *a, **k: (kind.name, True))
-    )
-    monkeypatch.setattr(
-        QInputDialog, "getText",
-        staticmethod(lambda *a, **k: (answers.pop(0), True)),
-    )
+    real_class = project_window.SectionDialog
+
+    def factory(dbase, section=None, parent=None):
+        dialog = real_class(dbase, section, parent)
+        dialog.code.setText("КЖ")
+        dialog.name.setText("Конструкции железобетонные")
+        dialog.kind.set_current_data(kind.id)
+        return dialog
+
+    monkeypatch.setattr(project_window, "SectionDialog", factory)
+    from PyQt6.QtWidgets import QDialog
+    monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Accepted)
 
     window = ProjectWindow(db, project.id)
     window.show()
@@ -347,4 +350,79 @@ def test_project_window_add_section_through_dialogs(db, project, qapp, monkeypat
 
     assert db.query(ProjectSection).count() == 1
     assert window.sections_table.item(0, 0).text() == "КЖ"
+    assert window.sections_table.item(0, 2).text() == "—", "организация не выбрана"
     window.close()
+
+
+@pytest.mark.gui
+def test_project_window_edit_section_changes_row(db, project, qapp, monkeypatch):
+    """Правка раздела из окна проекта меняет реквизиты (ТЗ п.21).
+
+    Раньше `update_section()` был доступен только из кода: оператор не мог
+    исправить раздел, не редактируя базу.
+    """
+    import app.ui.project_window as project_window
+    from PyQt6.QtWidgets import QDialog
+    from app.ui.project_window import ProjectWindow
+
+    kind = db.query(SectionKind).first()
+    section = service.add_section(
+        db, project.id, kind_id=kind.id, code="КЖ", name="Старое наименование",
+    )
+    real_class = project_window.SectionDialog
+
+    def factory(dbase, target=None, parent=None):
+        dialog = real_class(dbase, target, parent)
+        assert dialog.code.isReadOnly(), "код раздела при правке не меняется"
+        dialog.name.setText("Новое наименование")
+        dialog.sheets.setText("24")
+        return dialog
+
+    monkeypatch.setattr(project_window, "SectionDialog", factory)
+    monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Accepted)
+
+    window = ProjectWindow(db, project.id)
+    window.show()
+    window.sections_table.setCurrentCell(0, 0)
+    window.edit_section()
+
+    db.expire_all()
+    assert db.get(ProjectSection, section.id).name == "Новое наименование"
+    assert window.sections_table.item(0, 1).text() == "Новое наименование"
+    assert window.sections_table.item(0, 4).text() == "24", "листы не обновились"
+    window.close()
+
+
+@pytest.mark.gui
+def test_section_dialog_prefills_current_values(db, project, qapp):
+    """Диалог правки открывается с текущими реквизитами раздела (ТЗ п.21)."""
+    from app.ui.section_dialog import SectionDialog
+
+    kind = db.query(SectionKind).first()
+    # Организации и представители — справочники оператора, они не засеваются.
+    org = Organization(short_name="ЗАО «Строй»", inn="7701234567")
+    db.add(org)
+    db.commit()
+    designer = Representative(
+        organization_id=org.id, position="ГИП", full_name="Иванов Иван Иванович",
+    )
+    db.add(designer)
+    db.commit()
+    section = service.add_section(
+        db, project.id, kind_id=kind.id, code="КЖ", name="Конструкции",
+        organization_id=org.id, designer_rep_id=designer.id, sheets="12",
+    )
+
+    dialog = SectionDialog(db, section)
+
+    assert dialog.code.text() == "КЖ"
+    assert dialog.name.text() == "Конструкции"
+    assert dialog.values() == {
+        "code": "КЖ",
+        "name": "Конструкции",
+        "kind_id": kind.id,
+        "organization_id": org.id,
+        "designer_rep_id": designer.id,
+        "sheets": "12",
+        "required_details": "",
+    }

@@ -8,11 +8,22 @@ import pytest
 from PyQt6.QtWidgets import QMessageBox, QPushButton
 
 from app.core import domain
-from app.core.services import document_service, form_service
+from app.core.services import document_service, form_service, project_service
+from app.db.models import SectionKind
 from app.ui.document_form import (
     DocumentFormPanel, ExploitationChoiceWidget, SignatureBlocksWidget,
 )
 from app.ui.project_window import ProjectWindow
+from app.ui.reference_picker import ReferenceMultiPicker
+
+
+def _add_section(db, project, code="КЖ"):
+    """Раздел проектной документации для выбора в форме (ТЗ п.21)."""
+    kind = db.query(SectionKind).first()
+    return project_service.add_section(
+        db, project.id, kind_id=kind.id, code=code,
+        name=f"Конструкции {code}", sheets="12",
+    )
 
 
 @pytest.fixture
@@ -29,16 +40,23 @@ def _find_button(widget, text):
 
 
 def _set_field(panel, key, value):
-    panel.field_edits[key].setText(value)
+    """Заполнить поле формы: разделы выбираются из списка (ТЗ п.21)."""
+    edit = panel.field_edits[key]
+    if isinstance(edit, ReferenceMultiPicker):
+        edit.set_selected_values([value])
+    else:
+        edit.setText(value)
 
 
-def _fill_required(panel):
+def _fill_required(panel, sections=("КЖ",)):
     for key in (
-        "object_name", "address", "work_description", "section_refs",
+        "object_name", "address", "work_description",
         "work_period", "work_volume", "has_defects", "conclusion",
         "work_performer",
     ):
         _set_field(panel, key, "значение")
+    for code in sections:
+        _set_field(panel, "section_refs", code)
 
 
 # =====================================================================
@@ -58,6 +76,49 @@ def test_panel_loads_saved_draft(qapp, db, document):
     form_service.save_draft(db, document.id, {"object_name": "Корпус 2"})
     panel = DocumentFormPanel(db, document.id)
     assert panel.field_edits["object_name"].text() == "Корпус 2"
+
+
+def test_section_field_offers_project_sections(qapp, db, project):
+    """Разделы проекта выбираются из списка, а не вписываются текстом (ТЗ п.21)."""
+    _add_section(db, project, "КЖ")
+    _add_section(db, project, "АР")
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR
+    )
+
+    panel = DocumentFormPanel(db, document.id)
+    picker = panel.field_edits["section_refs"]
+
+    assert isinstance(picker, ReferenceMultiPicker)
+    assert picker.item_count() == 2
+    picker.set_selected_values(["КЖ"])
+    assert panel.payload()["section_refs"] == ["КЖ"]
+
+
+def test_section_field_keeps_saved_selection(qapp, db, project):
+    """Выбранные разделы восстанавливаются при открытии черновика (ТЗ п.21, 66)."""
+    _add_section(db, project, "КЖ")
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR
+    )
+    form_service.save_draft(db, document.id, {"section_refs": ["КЖ"]})
+
+    panel = DocumentFormPanel(db, document.id)
+
+    assert panel.field_edits["section_refs"].selected_values() == ["КЖ"]
+
+
+def test_section_field_rejects_code_outside_project(qapp, db, project):
+    """Раздел, не относящийся к проекту, выбрать нельзя (ТЗ п.21)."""
+    _add_section(db, project, "КЖ")
+    document = document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR
+    )
+    panel = DocumentFormPanel(db, document.id)
+
+    panel.field_edits["section_refs"].set_selected_values(["ЧУЖОЙ"])
+
+    assert "section_refs" not in panel.payload()
 
 
 def test_save_button_persists_draft(qapp, db, document):
