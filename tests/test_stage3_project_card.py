@@ -312,6 +312,32 @@ def test_card_dialog_marks_organizations_with_search(db, project, qapp):
     assert dialog.values()["organization_ids"] == [customer.id]
 
 
+@pytest.mark.gui
+def test_card_dialog_returns_chosen_customer_and_contractor(db, project, qapp):
+    """Заказчик и генподрядчик читаются из ReferencePicker (ТЗ п.17).
+
+    Дефект: значения брались через Qt-метод ``currentData()``, который у
+    ReferencePicker всегда None, поэтому выбранные организации терялись при
+    сохранении карточки.
+    """
+    from app.ui.project_window import ProjectCardDialog
+
+    customer = Organization(short_name="ЗАО «Заказчик»", inn="7703333333")
+    contractor = Organization(short_name="ООО «Генподрядчик»", inn="7704444444")
+    db.add_all([customer, contractor])
+    db.commit()
+
+    dialog = ProjectCardDialog(db, service.get_project(db, project.id))
+    assert dialog.values()["customer_org_id"] is None
+
+    dialog.customer_combo.set_current_data(customer.id)
+    dialog.contractor_combo.set_current_data(contractor.id)
+
+    values = dialog.values()
+    assert values["customer_org_id"] == customer.id
+    assert values["general_contractor_org_id"] == contractor.id
+
+
 def test_duplicate_section_code_is_blocked_by_database(db, project):
     """Уникальность кода держит сама БД, а не только проверка в сервисе."""
     from sqlalchemy.exc import IntegrityError

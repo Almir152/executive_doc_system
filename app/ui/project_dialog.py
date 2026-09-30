@@ -70,6 +70,6 @@ class ProjectCreateDialog(QDialog):
         """Данные для сервиса создания проекта."""
         return {
             "title": self.title_edit.text(),
-            "direction_id": self.direction_picker.currentData(),
+            "direction_id": self.direction_picker.current_data(),
             "address": self.address_edit.text(),
         }

@@ -120,6 +120,16 @@ class ReferencePicker(QComboBox):
         values = self._values()
         return values[row] if 0 <= row < len(values) else None
 
+    def currentData(self, role=Qt.ItemDataRole.UserRole):
+        """Значение справочника по имени Qt-метода.
+
+        Значения ReferencePicker хранит в списке Python, а не в UserRole
+        модели, поэтому унаследованный ``QComboBox.currentData()`` всегда
+        возвращал None. Обращение через Qt-имя не должно молча терять
+        выбранное значение (иначе форма считает, что выбор не сделан).
+        """
+        return self.current_data()
+
     def set_current_data(self, value) -> None:
         """Выбрать значение по его идентификатору."""
         self._proxy.setFilterFixedString("")

@@ -42,6 +42,20 @@ def test_picker_returns_selected_value(qapp):
     assert "Жилстрой" in picker.current_text()
 
 
+def test_picker_qt_name_returns_same_value(qapp):
+    """``currentData()`` не должен молча терять выбор (ТЗ п.20).
+
+    Дефект: формы читали значение через унаследованный ``currentData()``,
+    который у ReferencePicker всегда возвращал None, и выбор считался
+    несделанным.
+    """
+    picker = ReferencePicker()
+    picker.set_reference_items(ORGANIZATIONS)
+    picker.set_current_data(2)
+
+    assert picker.currentData() == picker.current_data() == 2
+
+
 def test_picker_starts_unselected(qapp):
     """Значение по умолчанию не выбрано: подставлять наугад нельзя."""
     picker = ReferencePicker()

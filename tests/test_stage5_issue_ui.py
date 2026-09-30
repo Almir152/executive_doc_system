@@ -41,6 +41,10 @@ class _StubDialog:
     def __init__(self, document, parent=None):
         self.document = document
 
+    def exec(self) -> int:
+        """Подтвердить выпуск без показа окна."""
+        return 1
+
     def doc_date(self) -> date:
         if self.date_value is None:
             raise ValueError(

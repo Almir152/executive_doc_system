@@ -5,6 +5,7 @@
 документов ещё нет (ТЗ п.16).
 """
 
+import logging
 import os
 import re
 import subprocess
@@ -12,6 +13,7 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
+from PyQt6 import sip
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
@@ -33,6 +35,8 @@ from app.ui.document_form import DocumentFormPanel, DocumentFormWindow
 from app.ui.package_dialog import PackageDialog
 from app.ui.reference_picker import ReferenceMultiPicker, ReferencePicker
 from app.ui.section_dialog import SectionDialog, kind_options as db_kinds
+
+log = logging.getLogger(__name__)
 
 _DATA_ROLE = Qt.ItemDataRole.UserRole
 _CHECKABLE = Qt.ItemFlag.ItemIsUserCheckable
@@ -245,8 +249,8 @@ class ProjectCardDialog(QDialog):
         return {
             "title": self.title_edit.text(),
             "address": self.address_edit.text(),
-            "customer_org_id": self.customer_combo.currentData(),
-            "general_contractor_org_id": self.contractor_combo.currentData(),
+            "customer_org_id": self.customer_combo.current_data(),
+            "general_contractor_org_id": self.contractor_combo.current_data(),
             "organization_ids": self.organizations_list.selected_values(),
         }
 
@@ -306,6 +310,9 @@ class ProjectWindow(QWidget):
         )
         self.sections_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
+        )
+        self.sections_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
         )
         sections_layout.addWidget(self.sections_table)
         layout.addWidget(self.sections_box)
@@ -440,6 +447,12 @@ class ProjectWindow(QWidget):
         self.materials_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
         )
+        self.materials_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        # Выбор материала должен сразу обновлять таблицу его актов: иначе
+        # «Убрать связь с актом» работает по актам предыдущего материала.
+        self.materials_table.itemSelectionChanged.connect(self._reload_material_acts)
         materials_layout.addWidget(self.materials_table)
 
         self.links_box = QGroupBox("Связанные документы выбранного документа")
@@ -574,6 +587,19 @@ class ProjectWindow(QWidget):
         self._load_history(project)
         self._reload_materials()
         self._reload_links()
+
+    def _refresh_history(self) -> None:
+        """Обновить таблицу истории после операции, писавшей событие (ТЗ п.86)."""
+        project = service.get_project(self.db, self.project_id)
+        if project is not None:
+            self._load_history(project)
+
+    def _reload_keeping_document(self) -> None:
+        """Полная перерисовка окна с сохранением выбранного документа."""
+        document = self._selected_document_quiet()
+        self.reload()
+        if document is not None:
+            self._select_document(document.id)
 
     def _card_text(self, project) -> str:
         parts = [
@@ -754,10 +780,33 @@ class ProjectWindow(QWidget):
                 page_numbering=dialog.page_numbering(),
                 allow_errors=result.has_errors,
             )
+        except package_service.PackagePartialError as exc:
+            # Комплект и запись в истории уже созданы: это не отказ, а
+            # недогруженные файлы.
+            self.reload()
+            QMessageBox.warning(self, "Комплект создан частично", str(exc))
+            return
         except (package_service.PackageError, printing.PrintError,
                 domain.UnknownLinkRole) as exc:
             # ТЗ п.73: место хранения предлагается выбрать заново.
             QMessageBox.warning(self, "Комплект не сформирован", str(exc))
+            return
+        except OSError as exc:
+            # Диск, права, длинные пути: сбой файловой операции не должен
+            # закрывать окно без объяснения.
+            QMessageBox.warning(
+                self, "Комплект не сформирован",
+                f"Ошибка файловой операции: {exc}\n\n"
+                "Проверьте свободное место и права на папку комплектов.",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - окно важнее падения
+            log.exception("Не удалось сформировать комплект")
+            QMessageBox.critical(
+                self, "Комплект не сформирован",
+                f"{type(exc).__name__}: {exc}\n\n"
+                "Подробности записаны в файл app.log рядом с базой.",
+            )
             return
         self.reload()
         QMessageBox.information(
@@ -881,17 +930,26 @@ class ProjectWindow(QWidget):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         created = 0
+        problem = None
         for document_id in dialog.selected_acts():
             try:
                 link_service.link_material_to_test_act(
                     self.db, material.id, document_id
                 )
             except link_service.MaterialError as exc:
-                QMessageBox.warning(self, "Связь не создана", str(exc))
-                return
+                # break, а не return: уже созданные связи должны быть видны,
+                # иначе счётчик актов и история останутся неверными.
+                problem = str(exc)
+                break
             created += 1
         self._reload_materials()
-        if created:
+        self._refresh_history()
+        if problem is not None:
+            QMessageBox.warning(
+                self, "Связь не создана",
+                f"{problem}\n\nСоздано связей до отказа: {created}.",
+            )
+        elif created:
             QMessageBox.information(
                 self, "Связи созданы",
                 f"Актов испытаний указано: {created}. Документ качества "
@@ -926,10 +984,15 @@ class ProjectWindow(QWidget):
             return
         for item in material.test_act_links:
             if item.document_id == acts[link].id:
-                link_service.unlink_material_from_test_act(self.db, item.id)
+                try:
+                    link_service.unlink_material_from_test_act(self.db, item.id)
+                except link_service.MaterialError as exc:
+                    QMessageBox.warning(self, "Связь не удалена", str(exc))
+                    break
                 break
         self._reload_materials()
         self._reload_material_acts()
+        self._refresh_history()
 
     def _reload_material_acts(self) -> None:
         """Показать акты испытаний выбранного материала (ТЗ п.44)."""
@@ -1050,8 +1113,7 @@ class ProjectWindow(QWidget):
             QMessageBox.warning(self, "Связь не создана", str(exc))
             return
         # Событие связи пишет сервис в своей транзакции (ТЗ п.86).
-        self._reload_links()
-        self._load_summary(service.get_project(self.db, self.project_id))
+        self._reload_keeping_document()
 
     def delete_link(self) -> None:
         """Удалить связь, сохранив архивный документ (ТЗ п.52)."""
@@ -1074,9 +1136,13 @@ class ProjectWindow(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        link_service.unlink_document_from_archive(self.db, link.id)
-        self._reload_links()
-        self._load_summary(service.get_project(self.db, self.project_id))
+        try:
+            link_service.unlink_document_from_archive(self.db, link.id)
+        except link_service.MaterialError as exc:
+            QMessageBox.warning(self, "Связь не удалена", str(exc))
+            self._reload_links()
+            return
+        self._reload_keeping_document()
 
     def _reload_finalized_acts(self, document) -> None:
         """Показать завершаемые акты и результат проверки дат (ТЗ п.87)."""
@@ -1122,18 +1188,24 @@ class ProjectWindow(QWidget):
             return
         values = dialog.values()
         created = 0
+        problem = None
         for related_id in dialog.selected_acts():
             try:
                 link_service.link_documents(
                     self.db, related_document_id=related_id, **values
                 )
             except link_service.MaterialError as exc:
-                QMessageBox.warning(self, "Связь не создана", str(exc))
-                return
+                # partial: уже созданные связи не откатываются
+                problem = str(exc)
+                break
             created += 1
-        self._reload_links()
-        self._load_summary(service.get_project(self.db, self.project_id))
-        if created:
+        self._reload_keeping_document()
+        if problem is not None:
+            QMessageBox.warning(
+                self, "Связь не создана",
+                f"{problem}\n\nСоздано связей до отказа: {created}.",
+            )
+        elif created:
             QMessageBox.information(
                 self, "Связи созданы",
                 f"Указано завершаемых актов: {created}. Проверка дат "
@@ -1162,9 +1234,13 @@ class ProjectWindow(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        link_service.unlink_documents(self.db, link.id)
-        self._reload_links()
-        self._load_summary(service.get_project(self.db, self.project_id))
+        try:
+            link_service.unlink_documents(self.db, link.id)
+        except link_service.MaterialError as exc:
+            QMessageBox.warning(self, "Связь не удалена", str(exc))
+            self._reload_links()
+            return
+        self._reload_keeping_document()
 
     def add_section(self) -> None:
         """Создать раздел проектной документации (ТЗ п.21)."""
@@ -1395,7 +1471,35 @@ class ProjectWindow(QWidget):
         except (printing.PrintError, domain.UnknownLinkRole) as exc:
             QMessageBox.warning(self, "Форма не напечатана", str(exc))
             return
-        os.startfile(path) if sys.platform == "win32" else _open_pdf(path, self)
+        except OSError as exc:
+            # Диск, права, длинные пути: PDF не создан, но окно должно жить.
+            QMessageBox.warning(
+                self, "Форма не напечатана",
+                f"Ошибка файловой операции: {exc}\n\n"
+                "Проверьте свободное место и права на выбранную папку.",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - окно важнее падения
+            log.exception("Не удалось напечатать форму документа")
+            QMessageBox.critical(
+                self, "Форма не напечатана",
+                f"{type(exc).__name__}: {exc}\n\n"
+                "Подробности записаны в файл app.log рядом с базой.",
+            )
+            return
+        # Печать пишет событие в историю (ТЗ п.86): обновляем таблицу.
+        self._refresh_history()
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # noqa: S606 — путь выбран оператором
+            else:
+                _open_pdf(path, self)
+        except OSError as exc:
+            QMessageBox.information(
+                self, "Форма напечатана",
+                f"Файл сохранён: {path}\nОткрыть автоматически не удалось: {exc}",
+            )
+            return
         QMessageBox.information(
             self, "Форма напечатана",
             f"Файл сохранён: {path} (ТЗ п.55–62).",
@@ -1419,7 +1523,32 @@ class ProjectWindow(QWidget):
         except printing.PrintError as exc:
             QMessageBox.warning(self, "Ведомость не напечатана", str(exc))
             return
-        os.startfile(path) if sys.platform == "win32" else _open_pdf(path, self)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Ведомость не напечатана",
+                f"Ошибка файловой операции: {exc}\n\n"
+                "Проверьте свободное место и права на выбранную папку.",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - окно важнее падения
+            log.exception("Не удалось напечатать ведомость состава проекта")
+            QMessageBox.critical(
+                self, "Ведомость не напечатана",
+                f"{type(exc).__name__}: {exc}\n\n"
+                "Подробности записаны в файл app.log рядом с базой.",
+            )
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # noqa: S606 — путь выбран оператором
+            else:
+                _open_pdf(path, self)
+        except OSError as exc:
+            QMessageBox.information(
+                self, "Ведомость напечатана",
+                f"Файл сохранён: {path}\nОткрыть автоматически не удалось: {exc}",
+            )
+            return
         QMessageBox.information(
             self, "Ведомость напечатана", f"Файл сохранён: {path} (ТЗ п.16).",
         )
@@ -1434,6 +1563,11 @@ class ProjectWindow(QWidget):
         if document is None:
             return
         dialog = IssueDialog(document, parent=self)
+        # Диалог раньше не показывался: дата читалась из невидимого поля, и
+        # документ без даты вообще нельзя было выпустить. Теперь оператор
+        # подтверждает выпуск и при необходимости вводит дату (ТЗ п.43, 85).
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
         try:
             doc_date = dialog.doc_date()
         except ValueError as exc:
@@ -1504,6 +1638,11 @@ class ProjectWindow(QWidget):
                 return
 
         if settings.form_open_mode() == settings.FORM_MODE_SEPARATE:
+            # Встроенная панель не должна остаться жить рядом с отдельным
+            # окном: иначе по одному документу открыты две формы.
+            self._destroy_form()
+            self.form_container.setVisible(False)
+            self.btn_close_form.setEnabled(False)
             self._open_form_separate(document)
             return
 
@@ -1517,15 +1656,31 @@ class ProjectWindow(QWidget):
 
     def _open_form_separate(self, document) -> None:
         """Показать форму в отдельном окне (ТЗ п.65)."""
-        if self.separate_form_window is not None:
-            self.separate_form_window.close()
-            self.separate_form_window = None
+        self._close_separate_form()
         window = DocumentFormWindow(
             self.db, document.id, project_id=document.project_id
         )
         window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # Закрытие окна оператором уничтожает объект C++; ссылку нужно
+        # обнулить, иначе следующее обращение к ней даст RuntimeError.
+        window.destroyed.connect(self._on_separate_form_destroyed)
         window.show()
         self.separate_form_window = window
+
+    def _on_separate_form_destroyed(self, obj=None) -> None:
+        if obj is self.separate_form_window:
+            self.separate_form_window = None
+
+    def _close_separate_form(self) -> None:
+        """Закрыть отдельное окно формы, если оно ещё существует."""
+        window = self.separate_form_window
+        if window is None:
+            return
+        if sip.isdeleted(window):
+            self.separate_form_window = None
+            return
+        window.close()
+        self.separate_form_window = None
 
     def _save_form_mode(self) -> None:
         """Сохранить выбранный режим открытия формы (ТЗ п.65)."""
@@ -1548,7 +1703,7 @@ class ProjectWindow(QWidget):
                 widget
                 for widget in (
                     self.sections_box, self.documents_box, self.materials_box,
-                    self.links_box, self.summary_box,
+                    self.links_box, self.summary_box, self.packages_box,
                 )
                 if widget.isVisible()
             ]
@@ -1573,9 +1728,7 @@ class ProjectWindow(QWidget):
         """Закрыть форму; незавершённый ввод предлагается сохранить (ТЗ п.66)."""
         if not self._close_form_confirmed():
             return
-        if self.separate_form_window is not None:
-            self.separate_form_window.close()
-            self.separate_form_window = None
+        self._close_separate_form()
         self._destroy_form()
         self.form_container.setVisible(False)
         self.btn_close_form.setEnabled(False)
@@ -1603,6 +1756,13 @@ class ProjectWindow(QWidget):
             if not panel.save():
                 return False
         return True
+
+    def closeEvent(self, event) -> None:
+        """Закрытие рабочего окна не должно молча терять ввод формы (ТЗ п.66)."""
+        if not self._close_form_confirmed():
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def delete_section(self) -> None:
         section = self._selected_section()

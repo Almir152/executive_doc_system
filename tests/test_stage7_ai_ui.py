@@ -140,7 +140,11 @@ def test_ai_is_hidden_when_disabled(db, project, monkeypatch, gui_support):
     window.projects_table.selectRow(0)
     assert window.ai_output.isVisible() is False
     window.run_ai_check()
-    assert "выключен" in window.ai_output.toPlainText().lower()
+    # Подсказка показывается диалогом: скрытое поле оператор не прочитал бы.
+    assert any(
+        "выключен" in text.lower()
+        for _, _, text in gui_support["information"]
+    )
     window.close()
 
 

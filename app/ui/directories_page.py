@@ -4,6 +4,7 @@
 в отдельную страницу, а не в окно проекта.
 """
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QTabWidget,
@@ -250,6 +251,7 @@ class DirectoryPage(QWidget):
                 ]
                 for o in rows
             ],
+            [o.id for o in rows],
         )
 
     def reload_representatives(self) -> None:
@@ -260,23 +262,32 @@ class DirectoryPage(QWidget):
                 r.position, r.full_name, r.phone or "—", r.email or "—",
             ]
             for r in rows
-        ])
+        ], [r.id for r in rows])
 
     def reload_section_kinds(self) -> None:
+        rows = service.list_section_kinds(self.db)
         self._fill(self.kind_table, [
-            [k.code, k.name] for k in service.list_section_kinds(self.db)
-        ])
+            [k.code, k.name] for k in rows
+        ], [k.id for k in rows])
 
     def reload_material_types(self) -> None:
+        rows = service.list_material_types(self.db)
         self._fill(self.material_type_table, [
-            [t.code, t.name] for t in service.list_material_types(self.db)
-        ])
+            [t.code, t.name] for t in rows
+        ], [t.id for t in rows])
 
-    def _fill(self, table: QTableWidget, rows: list[list[str]]) -> None:
+    def _fill(self, table: QTableWidget, rows: list[list[str]],
+              ids: list[int] | None = None) -> None:
         table.setRowCount(len(rows))
         for row_index, values in enumerate(rows):
             for column, value in enumerate(values):
-                table.setItem(row_index, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if column == 0 and ids is not None:
+                    # Идентификатор хранится в строке: поиск фильтрует
+                    # таблицу, и по номеру строки выбрать запись нельзя
+                    # (ТЗ п.20).
+                    item.setData(Qt.ItemDataRole.UserRole, ids[row_index])
+                table.setItem(row_index, column, item)
 
     # -----------------------------------------------------------------
     # ДЕЙСТВИЯ: организации
@@ -429,12 +440,26 @@ class DirectoryPage(QWidget):
 
     def _selected(self, table: QTableWidget, rows, subject: str):
         index = table.currentRow()
-        if index < 0 or index >= len(rows):
+        if index < 0:
             QMessageBox.information(
                 self, f"Выберите {subject}", f"Сначала выберите строку: {subject}."
             )
             return None
-        return rows[index]
+        item = table.item(index, 0)
+        selected_id = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        # Резолвим запись по идентификатору, а не по номеру строки: таблица
+        # может быть отфильтрована поиском, и строка не совпадает с позицией
+        # в полном списке (ТЗ п.20).
+        for row in rows:
+            if selected_id is not None and getattr(row, "id", None) == selected_id:
+                return row
+        if selected_id is None and 0 <= index < len(rows):
+            return rows[index]
+        QMessageBox.information(
+            self, f"Выберите {subject}",
+            f"Строка не найдена: обновите список и выберите {subject} заново.",
+        )
+        return None
 
     def _delete_with_confirm(self, name: str, action) -> None:
         answer = QMessageBox.question(

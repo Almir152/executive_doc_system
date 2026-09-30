@@ -341,6 +341,34 @@ def test_directories_page_search_filters_organizations(db, qapp):
 
 
 @pytest.mark.gui
+def test_directories_page_selection_survives_filter(db, qapp):
+    """При активном поиске правится выбранная строка, а не первая в базе.
+
+    Раньше edit/delete брали запись по номеру строки из полного списка,
+    поэтому при включённом поиске изменялась чужая организация (ТЗ п.20).
+    """
+    from app.ui.directories_page import DirectoryPage
+
+    service.save_organization(db, short_name="ООО «Альфа»")
+    service.save_organization(db, short_name="ООО «Монтаж»")
+    service.save_organization(db, short_name="ООО «Строй»")
+
+    page = DirectoryPage(db)
+    page.show()
+    page.org_search.setText("монтаж")
+    assert page.org_table.rowCount() == 1
+    page.org_table.selectRow(0)
+
+    selected = page._selected(
+        page.org_table, service.list_organizations(db), "организацию"
+    )
+
+    assert selected is not None
+    assert selected.short_name == "ООО «Монтаж»"
+    page.close()
+
+
+@pytest.mark.gui
 def test_directories_page_reports_duplicate_inn(db, qapp, monkeypatch):
     """Отказ на дубль ИНН должен быть виден оператору, а не ронять окно."""
     from PyQt6.QtWidgets import QDialog, QMessageBox

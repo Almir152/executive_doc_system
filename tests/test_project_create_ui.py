@@ -28,6 +28,39 @@ def test_create_project_dialog_has_all_card_fields(window, direction):
     assert set(values) == {"title", "direction_id", "address"}
 
 
+def test_real_dialog_returns_actually_selected_direction(window, direction):
+    """Выбранное направление действительно попадает в values() (ТЗ п.20).
+
+    Дефект приёмки: диалог читал значение через Qt-метод ``currentData()``,
+    а ReferencePicker хранит значение в своём списке. Выбор терялся, и
+    «Создать» отвечал «Выберите направление», хотя оно было выбрано.
+    """
+    from app.ui.project_dialog import ProjectCreateDialog
+
+    dialog = ProjectCreateDialog(window.db, window)
+    assert dialog.values()["direction_id"] is None
+    assert dialog.direction_picker.count() > 1, "справочник направлений пуст"
+
+    dialog.direction_picker.set_current_data(direction.id)
+
+    assert dialog.values()["direction_id"] == direction.id
+
+
+def test_real_dialog_creation_saves_chosen_direction(window, direction):
+    """Полный путь: реальный диалог -> create_project сохраняет направление."""
+    from app.ui.project_dialog import ProjectCreateDialog
+    from app.core.services.project_service import create_project
+
+    dialog = ProjectCreateDialog(window.db, window)
+    dialog.title_edit.setText("Проект из реального диалога")
+    dialog.direction_picker.set_current_data(direction.id)
+
+    project = create_project(window.db, **dialog.values())
+
+    assert project.direction_id == direction.id
+    assert project.title == "Проект из реального диалога"
+
+
 def test_create_project_dialog_offers_directions_from_directory(window):
     """Направления берутся из справочника, а не из захардкоженного списка."""
     from app.ui.project_dialog import direction_options

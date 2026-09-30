@@ -4,6 +4,8 @@
 предлагает сохранить незавершённый ввод при закрытии (ТЗ п.66).
 """
 
+import logging
+
 from PyQt6.QtWidgets import (
     QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton,
@@ -13,6 +15,8 @@ from PyQt6.QtWidgets import (
 from app.core import domain
 from app.core.services import form_service, project_service
 from app.ui.reference_picker import ReferenceMultiPicker
+
+log = logging.getLogger(__name__)
 
 # Признак поля, заполняемого выбором разделов проекта (ТЗ п.21).
 SECTION_SOURCE = "section"
@@ -328,6 +332,13 @@ class DocumentFormPanel(QWidget):
             elif isinstance(edit, QTextEdit):
                 value = edit.toPlainText().strip()
             else:
+                # Неизвестный редактор раньше молча терял значение. Теперь
+                # это видно в журнале: пропавшее поле невозможно заметить
+                # глазами, а причина должна быть найдена (ТЗ п.66).
+                log.warning(
+                    "Поле формы %r: неизвестный редактор %s, значение не "
+                    "сохранено", key, type(edit).__name__,
+                )
                 continue
             if value:
                 result[key] = value
@@ -339,17 +350,23 @@ class DocumentFormPanel(QWidget):
         Перед сохранением незаполненного представителя эксплуатации
         предлагается выбрать, как выводить поле (ТЗ п.64).
         """
-        if validate:
-            found = form_service.check_payload(self.db, self.document_id, self.payload())
-            if found:
-                self.problems.setPlainText("\n".join(f"• {p}" for p in found))
-                QMessageBox.warning(
-                    self, "Форма заполнена не полностью",
-                    "Незаполненные поля перечислены внизу (ТЗ п.96).",
+        try:
+            if validate:
+                found = form_service.check_payload(
+                    self.db, self.document_id, self.payload()
                 )
-                return False
+                if found:
+                    self.problems.setPlainText("\n".join(f"• {p}" for p in found))
+                    QMessageBox.warning(
+                        self, "Форма заполнена не полностью",
+                        "Незаполненные поля перечислены внизу (ТЗ п.96).",
+                    )
+                    return False
 
-        decision = self._ask_exploitation_decision()
+            decision = self._ask_exploitation_decision()
+        except form_service.FormError as exc:
+            QMessageBox.warning(self, "Форма не проверена", str(exc))
+            return False
         if decision is False:
             return False
 
@@ -367,9 +384,22 @@ class DocumentFormPanel(QWidget):
             QMessageBox.warning(self, "Форма не сохранена", str(exc))
             return False
 
-        problems = self.signatures.save()
+        try:
+            problems = self.signatures.save()
+        except Exception as exc:  # noqa: BLE001 - окно важнее падения
+            log.exception("Не удалось сохранить подписантов")
+            QMessageBox.critical(
+                self, "Подписанты не сохранены",
+                f"{type(exc).__name__}: {exc}\n\n"
+                "Черновик формы сохранён. Повторите сохранение подписантов.",
+            )
+            return False
         if problems:
             self.problems.setPlainText("\n".join(f"• {p}" for p in problems))
+            QMessageBox.warning(
+                self, "Подписанты заполнены не полностью",
+                "Ошибки перечислены внизу. Черновик формы сохранён (ТЗ п.63).",
+            )
             return False
         self.exploitation.reload()
         self.problems.setPlainText("")
@@ -436,6 +466,35 @@ class DocumentFormWindow(QMainWindow):
         self.resize(900, 800)
         self.panel = DocumentFormPanel(db, document_id, project_id=project_id)
         self.setCentralWidget(self.panel)
+
+    def closeEvent(self, event) -> None:
+        """Предложить сохранить незавершённый ввод при закрытии (ТЗ п.66)."""
+        panel = self.panel
+        try:
+            unsaved = form_service.has_unsaved_work(
+                self.db, panel.document_id, panel.payload()
+            )
+        except Exception:  # noqa: BLE001 - форма всё равно должна закрыться
+            log.exception("Не удалось проверить незавершённый ввод формы")
+            unsaved = False
+        if not unsaved:
+            super().closeEvent(event)
+            return
+        answer = QMessageBox.question(
+            self, "Незавершённая форма (ТЗ п.66)",
+            "Форма заполнена не полностью. Сохранить черновик перед закрытием?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            event.ignore()
+            return
+        if answer == QMessageBox.StandardButton.Save and not panel.save():
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 def _status_label(status: str | None) -> str:

@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QMessageBox, QStackedWidget, QFileDialog,
     QLineEdit, QFormLayout, QComboBox, QGroupBox
 )
+from PyQt6 import sip
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCloseEvent
 
@@ -26,12 +27,15 @@ from app.ai.connector import (
 from app.core.services import ai_service, backup_service, storage_service
 from app.core.services.storage_service import (
     ARCHIVE_CATEGORIES, ARCHIVE_CATEGORY_DEFAULT, StorageError, add_file_to_archive,
-    calculate_hash, find_by_hash,
+    calculate_hash, can_delete_archive_document, delete_archive_document,
+    find_by_hash,
 )
 from app.ui.archive_dialog import show_upload_dialog
 from app.core.services import export_checks
 from app.core.services.export_checks import check_package
-from app.core.services.package_service import PackageError, create_package
+from app.core.services.package_service import (
+    PackageError, PackagePartialError, create_package,
+)
 from app.core.services.printing import PrintError
 from app.core.domain import UnknownLinkRole
 from app.ui.package_dialog import PackageDialog
@@ -189,8 +193,12 @@ class MainWindow(QMainWindow):
         self.projects_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         # ТЗ п.16: рабочее окно проекта открывается из списка проектов.
         self.projects_table.itemDoubleClicked.connect(self.open_project_window)
-        # Выбор проекта в таблице — это и есть выбор проекта для ИИ.
-        self.projects_table.itemSelectionChanged.connect(self.refresh_ai_state)
+        # Выбор проекта в таблице — это и есть выбор проекта для ИИ, архива
+        # и списка файлов. Раньше при смене проекта архив и файлы ИИ
+        # оставались от прежнего проекта, и оператор видел чужие данные.
+        self.projects_table.itemSelectionChanged.connect(
+            self._on_project_selection_changed
+        )
         layout.addWidget(self.projects_table)
 
         return page
@@ -205,13 +213,38 @@ class MainWindow(QMainWindow):
                 "Сначала выберите проект в таблице.",
             )
             return
-        if self.project_window is not None:
-            self.project_window.close()
-        self.project_window = ProjectWindow(self.db, project_id, self)
-        self.project_window.show()
-        self.project_window.setAttribute(
-            Qt.WidgetAttribute.WA_DeleteOnClose, True
+        self._destroy_project_window()
+        # Окно проекта закрывается вместе с запуском новой копии. Без
+        # удаления по закрытию прежние окна накапливались бы и продолжали
+        # держать соединение с базой.
+        window = ProjectWindow(self.db, project_id, self)
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        window.destroyed.connect(
+            lambda _obj=None, ref=window: self._forget_project_window(ref)
         )
+        self.project_window = window
+        window.show()
+
+    def _destroy_project_window(self) -> None:
+        """Закрыть прежнее рабочее окно, если оно ещё живёт."""
+        window = self.project_window
+        self.project_window = None
+        if window is None or sip.isdeleted(window):
+            return
+        try:
+            window.close()
+        except RuntimeError:
+            # Объект уничтожен между проверкой и вызовом: ничего не делаем.
+            pass
+
+    def _forget_project_window(self, ref) -> None:
+        """Обработать удаление окна проекта после WA_DeleteOnClose.
+
+        Сравнение по идентичности: к моменту сигнала могло быть создано
+        новое окно, и обнулять его ссылку нельзя.
+        """
+        if self.project_window is ref:
+            self.project_window = None
 
     def create_archive_page(self):
         page = QWidget()
@@ -228,6 +261,13 @@ class MainWindow(QMainWindow):
         btn_upload.setStyleSheet("background-color: #e6f7ff;")
         btn_upload.clicked.connect(self.upload_to_archive)
         cat_layout.addWidget(btn_upload)
+
+        # ТЗ п.50, 109: ошибочно загруженный файл можно удалить, пока на него
+        # нет ссылок. Без кнопки запись оставалась в архиве навсегда.
+        self.btn_delete_archive = QPushButton("Удалить из архива")
+        self.btn_delete_archive.setStyleSheet("background-color: #ffdddd; color: #990000;")
+        self.btn_delete_archive.clicked.connect(self.delete_archive_file)
+        cat_layout.addWidget(self.btn_delete_archive)
         cat_layout.addStretch()
         layout.addLayout(cat_layout)
 
@@ -246,6 +286,12 @@ class MainWindow(QMainWindow):
              "Связей"]
         )
         self.archive_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.archive_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.archive_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
         layout.addWidget(self.archive_table)
 
         return page
@@ -514,11 +560,31 @@ class MainWindow(QMainWindow):
     # ЛОГИКА
     # -----------------------------------------------------------------
     def on_nav_changed(self, row: int):
+        # currentRowChanged приходит и с -1, когда список очищают или
+        # перестраивают. item(-1) вернул бы None, и обращение к .text()
+        # роняло бы окно вместе с приложением.
+        if row < 0:
+            return
         self.stack.setCurrentIndex(row)
-        self.title_label.setText(f"Рабочая область: {self.nav_list.item(row).text()}")
+        item = self.nav_list.item(row)
+        if item is not None:
+            self.title_label.setText(f"Рабочая область: {item.text()}")
         # Подсказка о текущем проекте на странице ИИ должна отражать выбор,
         # сделанный в «Проектах».
         self.refresh_ai_state()
+
+    def _on_project_selection_changed(self):
+        """Обновить всё, что зависит от выбранного проекта.
+
+        Проект выбирается в одном месте, а зависят от него подсказка ИИ,
+        список файлов для ИИ и таблица архива. Общий обработчик убирает
+        рассинхронизацию, из-за которой архив показывал файлы прежнего
+        проекта (ТЗ п.44, 102, 103).
+        """
+        project_id = self.selected_project_id()
+        self.refresh_ai_state()
+        self.load_archive_files(self.archive_search_input.text())
+        self.load_ai_file_list(project_id)
 
     def selected_project_id(self) -> int | None:
         """ID выбранного проекта или None, если проект не выбран."""
@@ -566,15 +632,28 @@ class MainWindow(QMainWindow):
         rows = self.forms_table.selectionModel().selectedRows() \
             if self.forms_table.selectionModel() else []
         if not rows:
+            self.forms_detail.setText("")
             return
         row = rows[0].row()
-        doc_type = self.forms_table.item(row, 0).text()
-        version = self.forms_table.item(row, 1).text().split()[0].lstrip("v")
+        type_item = self.forms_table.item(row, 0)
+        version_item = self.forms_table.item(row, 1)
+        if type_item is None or version_item is None:
+            self.forms_detail.setText("")
+            return
+        doc_type = type_item.text()
+        try:
+            version = int(version_item.text().split()[0].lstrip("v"))
+        except (IndexError, ValueError):
+            self.forms_detail.setText("Не удалось определить версию формы.")
+            return
+        doc_type_value = next(
+            (value for value, label in domain.DOC_TYPE_LABELS.items()
+             if label == doc_type),
+            doc_type,
+        )
         form = self.db.query(NormativeForm).filter_by(
-            doc_type=next(
-                (k for k, v in domain.DOC_TYPE_LABELS.items() if v == doc_type),
-                doc_type),
-            version=int(version),
+            doc_type=doc_type_value,
+            version=version,
         ).one_or_none()
         if form is None:
             self.forms_detail.setText("")
@@ -699,6 +778,66 @@ class MainWindow(QMainWindow):
             f"Связей: {archive_doc.links_count}",
         )
 
+    def _selected_archive_id(self) -> int | None:
+        row = self.archive_table.currentRow()
+        if row < 0:
+            return None
+        item = self.archive_table.item(row, 0)
+        if item is None:
+            return None
+        try:
+            return int(item.text())
+        except ValueError:
+            return None
+
+    def delete_archive_file(self):
+        """Удалить архивный документ, если он не используется (ТЗ п.109)."""
+        project_id = self.selected_project_id()
+        if project_id is None:
+            QMessageBox.warning(
+                self, "Удаление из архива",
+                "Выберите проект в разделе «Проекты»: архив принадлежит проекту.",
+            )
+            return
+        archive_id = self._selected_archive_id()
+        if archive_id is None:
+            QMessageBox.warning(
+                self, "Удаление из архива",
+                "Выберите строку в таблице архива.",
+            )
+            return
+        can_delete, links = can_delete_archive_document(self.db, archive_id)
+        if not can_delete:
+            QMessageBox.warning(
+                self, "Удаление невозможно",
+                f"Архивный документ связан с {links} документами. Сначала "
+                "снимите связи в рабочем окне проекта: иначе история потеряет "
+                "ссылку на доказательство (ТЗ п.109).",
+            )
+            return
+        answer = QMessageBox.question(
+            self, "Удаление из архива",
+            "Удалить архивный документ вместе с его файлами? Действие "
+            "необратимо.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            delete_archive_document(self.db, archive_id)
+        except (StorageError, OSError) as exc:
+            QMessageBox.critical(self, "Удаление невозможно", str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - окно важнее падения
+            log.exception("Не удалось удалить архивный документ")
+            QMessageBox.critical(
+                self, "Удаление невозможно",
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+        self.load_archive_files(self.archive_search_input.text())
+
     def load_norms(self):
         self.norms_table.setRowCount(0)
         for n in self.norms_data:
@@ -725,6 +864,8 @@ class MainWindow(QMainWindow):
         Выбранный режим сохраняется: обработка данных не должна
         молча возвращаться к другой при следующем запуске.
         """
+        if not 0 <= index < len(MODE_ORDER):
+            return
         self.ai.mode = MODE_ORDER[index]
         settings.set_ai_mode(self.ai.mode)
         self.refresh_ai_state()
@@ -739,7 +880,16 @@ class MainWindow(QMainWindow):
         settings.set_setting("gigachat_scope", self.ai_scope_edit.text().strip())
         entered = self.ai_key_edit.text().strip()
         if entered:
-            backend = self.secrets.set(secret_store.GIGACHAT_KEY, entered)
+            try:
+                backend = self.secrets.set(secret_store.GIGACHAT_KEY, entered)
+            except Exception as exc:  # noqa: BLE001 - окно важнее падения
+                log.exception("Не удалось сохранить ключ ИИ")
+                QMessageBox.critical(
+                    self, "ИИ-агент",
+                    f"Не удалось сохранить ключ.\n\n"
+                    f"{type(exc).__name__}: {exc}",
+                )
+                return
             self.ai_key_edit.clear()
             self.ai_key_state.setText(
                 "Ключ сохранён средствами Windows."
@@ -773,7 +923,15 @@ class MainWindow(QMainWindow):
         """Удалить ключ: без него интернет-ИИ работать не сможет."""
         from app.ai import secrets as secret_store
 
-        self.secrets.forget(secret_store.GIGACHAT_KEY)
+        try:
+            self.secrets.forget(secret_store.GIGACHAT_KEY)
+        except Exception as exc:  # noqa: BLE001 - окно важнее падения
+            log.exception("Не удалось удалить ключ ИИ")
+            QMessageBox.critical(
+                self, "ИИ-агент",
+                f"Не удалось удалить ключ.\n\n{type(exc).__name__}: {exc}",
+            )
+            return
         self.ai_key_edit.clear()
         self.ai.provider = build_internet_provider()
         self.refresh_ai_key_state()
@@ -837,8 +995,20 @@ class MainWindow(QMainWindow):
             self.ai_output.setVisible(self.ai.enabled)
         if getattr(self, "btn_run_ai", None) is not None:
             self.btn_run_ai.setVisible(self.ai.enabled)
+            self.btn_run_ai.setEnabled(self.ai.enabled)
         if not self.ai.enabled and getattr(self, "ai_output", None) is not None:
             self.ai_output.clear()
+
+        # ТЗ п.103: в интернет-режиме текст файлов передавать нельзя. Раньше
+        # галочки оставались доступными, и отказ всплывал только после нажатия
+        # «Проверить»; теперь это видно заранее и не выглядит как ошибка.
+        if getattr(self, "ai_files_list", None) is not None:
+            allow_files = self.ai.enabled and self.ai.mode != MODE_INTERNET
+            self.ai_files_list.setEnabled(allow_files)
+            if self.ai.enabled and self.ai.mode == MODE_INTERNET:
+                for index in range(self.ai_files_list.count()):
+                    item = self.ai_files_list.item(index)
+                    item.setCheckState(Qt.CheckState.Unchecked)
 
     def add_project(self):
         # Направление выбирается из справочника (ТЗ п.14, 20), а не из
@@ -958,12 +1128,36 @@ class MainWindow(QMainWindow):
                 page_numbering=dialog.page_numbering(),
                 allow_errors=result.has_errors,
             )
+        except PackagePartialError as exc:
+            # Папка комплекта уже создана, но часть файлов не выгружена.
+            # Говорить «не сформирован» неверно: оператор должен знать, что
+            # результат есть и его нужно проверить (ТЗ п.83, 98).
+            QMessageBox.warning(
+                self, "Комплект сформирован частично", str(exc)
+            )
+            return
         except (PackageError, PrintError, UnknownLinkRole) as exc:
             # ТЗ п.73: место хранения предлагается выбрать заново.
             QMessageBox.critical(self, "Комплект не сформирован", str(exc))
             return
         except StorageError as exc:
             QMessageBox.critical(self, "Ошибка файла", str(exc))
+            return
+        except OSError as exc:
+            log.exception("Ошибка файловой операции при формировании комплекта")
+            QMessageBox.critical(
+                self, "Комплект не сформирован",
+                f"Ошибка файловой операции: {exc}\n\n"
+                "Проверьте свободное место и права на выбранную папку.",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - окно важнее падения
+            log.exception("Не удалось сформировать комплект")
+            QMessageBox.critical(
+                self, "Комплект не сформирован",
+                f"{type(exc).__name__}: {exc}\n\n"
+                "Подробности записаны в файл app.log рядом с базой.",
+            )
             return
 
         folder = os.path.normpath(package.absolute_path)
@@ -1016,7 +1210,12 @@ class MainWindow(QMainWindow):
         предложения сохраняются черновиками (ТЗ п.105).
         """
         if not self.ai.enabled:
-            self.ai_output.setText("ИИ выключен. Включите его в настройках.")
+            # Скрытый ai_output не прочитал бы оператор: при выключенном ИИ
+            # текст «ИИ выключен» оставался бы вне поля зрения (ТЗ п.9).
+            QMessageBox.information(
+                self, "ИИ-агент",
+                "ИИ выключен. Включите его в разделе «Настройки» (ТЗ п.9).",
+            )
             return
         project_id = self.selected_project_id()
         if project_id is None:
@@ -1252,9 +1451,23 @@ class MainWindow(QMainWindow):
         return report
 
     def load_backups(self):
-        """Показать имеющиеся копии: свежие сверху (ТЗ п.74)."""
+        """Показать имеющиеся копии: свежие сверху (ТЗ п.74).
+
+        Список копий строится при запуске и при восстановлении. Ошибка
+        чтения папки копий (диск отключён, нет прав) не должна мешать
+        открыть программу, поэтому она только показывается оператору.
+        """
         self.backup_list.setRowCount(0)
-        for item in backup_service.list_backups(BACKUP_DIR):
+        try:
+            items = backup_service.list_backups(BACKUP_DIR)
+        except (backup_service.BackupError, OSError) as exc:
+            log.exception("Не удалось прочитать список резервных копий")
+            self.backup_list.setRowCount(1)
+            self.backup_list.setItem(
+                0, 0, QTableWidgetItem(f"Ошибка чтения копий: {exc}")
+            )
+            return
+        for item in items:
             counts = item.get("counts", {})
             row = self.backup_list.rowCount()
             self.backup_list.insertRow(row)
@@ -1327,9 +1540,7 @@ class MainWindow(QMainWindow):
         освобождаются, а оператору предлагается перезапустить программу:
         открытые списки и окно проекта показывали бы прежние данные.
         """
-        if self.project_window is not None:
-            self.project_window.close()
-            self.project_window = None
+        self._destroy_project_window()
         folder = QFileDialog.getExistingDirectory(
             self, "Папка резервной копии", str(BACKUP_DIR)
         )
@@ -1397,6 +1608,6 @@ class MainWindow(QMainWindow):
         """Безопасно закрываем подключение к SQLite при выходе (важно для Windows)"""
         try:
             self.db.close()
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 - выход важнее ошибки закрытия
+            log.exception("Не удалось закрыть соединение с базой при выходе")
         super().closeEvent(event)
