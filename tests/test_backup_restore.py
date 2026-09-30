@@ -623,3 +623,94 @@ def test_describe_backup_readable_for_operator(db, populated):
     text = backup_service.describe_backup(folder)
     assert "Проектов: 1" in text
     assert "Файлов архива: 1" in text
+
+
+# =====================================================================
+# Файловые ошибки не доходят до интерфейса (ТЗ п.98, 106)
+# =====================================================================
+
+
+def _paths(storage):
+    """Пути хранилища в именах, которые ждут сервисы."""
+    return {
+        "base_dir": storage["backup_dir"],
+        "db_path": storage["db_path"],
+        "archive_dir": storage["archive_dir"],
+        "settings_path": storage["settings_path"],
+    }
+
+
+def test_create_backup_reports_readonly_storage(db, live_storage, monkeypatch):
+    """Нет прав на папку копий — понятная ошибка вместо падения программы.
+
+    Созданная сборка отдавала PermissionError наружу, а в слоте Qt это закрывало
+    всё приложение: оператор видел только исчезновение окна.
+    """
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(backup_service, "ensure_dirs", refuse)
+
+    with pytest.raises(backup_service.BackupError) as failure:
+        backup_service.create_backup(db, **_paths(live_storage))
+
+    assert "Permission denied" in str(failure.value)
+    assert "права на запись" in str(failure.value)
+
+
+def test_create_backup_reports_taken_folder_name(db, live_storage, monkeypatch):
+    """Занятое имя папки копии не приводит к FileExistsError наружу."""
+    backup_service.create_backup(db, **_paths(live_storage))
+    real_mkdir = Path.mkdir
+
+    def refuse(path, *args, **kwargs):
+        if path.name.startswith(backup_service.BACKUP_PREFIX):
+            raise FileExistsError(17, "File exists")
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", refuse)
+
+    with pytest.raises(backup_service.BackupError) as failure:
+        backup_service.create_backup(db, **_paths(live_storage))
+
+    assert "File exists" in str(failure.value)
+    assert "права на запись" in str(failure.value)
+
+
+def test_create_backup_leaves_no_staging_folder_after_failure(db, live_storage,
+                                                               monkeypatch):
+    """После отказа черновая папка сборки не остаётся в каталоге копий."""
+    def refuse(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(backup_service, "_copy_settings", refuse)
+
+    with pytest.raises(backup_service.BackupError):
+        backup_service.create_backup(db, **_paths(live_storage))
+
+    leftovers = [
+        item.name for item in live_storage["backup_dir"].iterdir()
+        if item.name.startswith(".")
+    ]
+    assert leftovers == []
+
+
+def test_restore_reports_readonly_storage(db, live_storage, monkeypatch):
+    """Файловая ошибка восстановления описана, а не поднимается наружу."""
+    folder = backup_service.create_backup(db, **_paths(live_storage))
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(backup_service, "_install_database", refuse)
+
+    with pytest.raises(backup_service.BackupError) as failure:
+        backup_service.restore_backup(
+            folder,
+            db_path=live_storage["db_path"],
+            archive_dir=live_storage["archive_dir"],
+            settings_path=live_storage["settings_path"],
+        )
+
+    assert "Permission denied" in str(failure.value)
+    assert "права на запись" in str(failure.value)

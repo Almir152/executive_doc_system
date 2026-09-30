@@ -530,3 +530,60 @@ def test_aook_validator_tolerates_missing_link_list():
     start = datetime(2026, 1, 1)
     validate_aook_dates(start, start, None)
     validate_aook_dates(start, start, [])
+
+
+# -------------------------------------------------------------------
+# НЕОБРАБОТАННЫЕ ОШИБКИ (ТЗ п.106)
+# -------------------------------------------------------------------
+def test_crash_handler_replaces_silent_exit(qapp, monkeypatch):
+    """Необработанная ошибка показывается окном, а не закрывает программу.
+
+    Собранное приложение оконное (console=False): без обработчика
+    необработанное исключение в слоте Qt завершает процесс, и оператор
+    видит только исчезновение окна без причины.
+    """
+    import sys
+
+    import main
+
+    original = sys.excepthook
+    shown = {}
+    monkeypatch.setattr(
+        "main.QMessageBox",
+        type("Box", (), {
+            "Icon": type("Icon", (), {"Critical": None}),
+            "__init__": lambda self, *args, **kwargs: None,
+            "setText": lambda self, text: shown.update(text=text),
+            "setInformativeText": lambda self, text: None,
+            "exec": lambda self: 0,
+        }),
+    )
+    try:
+        main.install_crash_handler()
+        try:
+            raise PermissionError(13, "Permission denied")
+        except PermissionError:
+            sys.excepthook(*sys.exc_info())
+    finally:
+        sys.excepthook = original
+
+    assert "PermissionError" in shown["text"]
+    assert "app.log" in shown["text"]
+
+
+def test_crash_handler_keeps_keyboard_interrupt(qapp, monkeypatch):
+    """Ctrl+C не перехватывается: программа должна завершаться сама."""
+    import sys
+
+    import main
+
+    original = sys.excepthook
+    called = []
+    monkeypatch.setattr(sys, "__excepthook__", lambda *args: called.append(args))
+    try:
+        main.install_crash_handler()
+        sys.excepthook(KeyboardInterrupt, KeyboardInterrupt(), None)
+    finally:
+        sys.excepthook = original
+
+    assert len(called) == 1

@@ -454,3 +454,57 @@ def test_section_dialog_prefills_current_values(db, project, qapp):
         "sheets": "12",
         "required_details": "",
     }
+
+
+# =====================================================================
+# СОЗДАНИЕ ПРОЕКТА (ТЗ п.17, 20)
+# =====================================================================
+
+
+def test_create_project_keeps_address_as_entered(db, direction):
+    """Введённый адрес сохраняется как есть (ТЗ п.17)."""
+    created = service.create_project(
+        db, title="  Корпус 2  ", direction_id=direction.id,
+        address="  г. Москва, ул. Ленина 1  ",
+    )
+
+    assert created.title == "Корпус 2"
+    assert created.address == "г. Москва, ул. Ленина 1"
+
+
+def test_create_project_without_address_stores_nothing(db, direction):
+    """Пустой адрес остаётся пустым, а не превращается в «Не указан».
+
+    Дефект: программа подставляла «Не указан» молча, и оператор искал
+    потерянный адрес, которого никто не вводил.
+    """
+    created = service.create_project(
+        db, title="Корпус 3", direction_id=direction.id, address="   "
+    )
+
+    db.expire_all()
+    stored = service.get_project(db, created.id)
+    assert stored.address is None
+    assert "Не указан" not in (stored.address or "")
+
+
+def test_create_project_requires_title(db, direction):
+    """Без наименования проект не создаётся (ТЗ п.17)."""
+    with pytest.raises(service.ProjectError, match="Наименование"):
+        service.create_project(db, title="  ", direction_id=direction.id)
+
+
+def test_create_project_requires_known_direction(db):
+    """Направление берётся из справочника, а не из произвольного числа."""
+    with pytest.raises(service.ProjectError, match="Направление не найдено"):
+        service.create_project(db, title="Корпус", direction_id=9999)
+
+
+def test_create_project_is_recorded_in_history(db, direction):
+    """Создание проекта попадает в историю (ТЗ п.86)."""
+    created = service.create_project(
+        db, title="Корпус 4", direction_id=direction.id
+    )
+
+    events = service.list_events(db, created.id)
+    assert any(event.event_type == "project_created" for event in events)

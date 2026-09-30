@@ -314,7 +314,7 @@ def test_directories_page_lists_all_four_books(db, qapp):
     page.show()
 
     assert [page.tabs.tabText(i) for i in range(page.tabs.count())] == [
-        "Организации", "Представители", "Разделы", "Типы материалов",
+        "Организации", "Представители", "Виды разделов", "Типы материалов",
     ]
     assert page.org_table.rowCount() == 0, "справочник организаций пуст"
     assert page.kind_table.rowCount() >= 11, "разделы из ТЗ п.22 должны быть"

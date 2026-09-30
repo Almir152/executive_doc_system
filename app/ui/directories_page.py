@@ -166,11 +166,13 @@ class DirectoryPage(QWidget):
             self.add_representative, self.edit_representative,
             self.delete_representative,
         ), "Представители")
+        # Название вкладки уточнено намеренно: в рабочем окне проекта есть
+        # «Разделы», и в приёмке «Справочники → Разделы» принимали за них.
         self.tabs.addTab(self._build_tab(
-            "Разделы (ТЗ п.22)",
+            "Виды разделов (ТЗ п.22)",
             ["Код", "Наименование"],
             self.add_section_kind, self.edit_section_kind, self.delete_section_kind,
-        ), "Разделы")
+        ), "Виды разделов")
         self.tabs.addTab(self._build_tab(
             "Типы материалов (ТЗ п.44)",
             ["Код", "Наименование"],
@@ -221,7 +223,7 @@ class DirectoryPage(QWidget):
             self.org_table = table
         elif "Представители" in hint:
             self.rep_table = table
-        elif "Разделы" in hint:
+        elif "Виды разделов" in hint:
             self.kind_table = table
         else:
             self.material_type_table = table

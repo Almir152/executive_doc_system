@@ -238,3 +238,95 @@ def test_restore_without_choice_does_nothing(qapp, window, issued_project,
         assert session.query(Project).count() == 1
     finally:
         session.close()
+
+
+# =====================================================================
+# Программа не закрывается молча (ТЗ п.106)
+# =====================================================================
+
+
+def test_file_error_does_not_close_the_program(qapp, window, project,
+                                                monkeypatch):
+    """Файловая ошибка показывается окном, а не закрывает приложение.
+
+    Отказ при создании копии выглядел как исчезновение окна программы:
+    необработанное исключение в слоте Qt завершает процесс без сообщения.
+    """
+    shown = {}
+    monkeypatch.setattr(
+        "app.ui.main_window.QMessageBox.critical",
+        lambda parent, title, text: shown.update(title=title, text=text),
+    )
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(backup_service, "create_backup", refuse)
+    window.create_backup_action()
+
+    assert shown["title"] == "Резервная копия"
+    assert "Permission denied" in shown["text"]
+    assert "app.log" in shown["text"]
+
+
+def test_storage_problem_reaches_the_operator(qapp, window, project,
+                                              monkeypatch):
+    """Файловая ошибка хранилища описана языком оператора (ТЗ п.98)."""
+    shown = {}
+    monkeypatch.setattr(
+        "app.ui.main_window.QMessageBox.information",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.ui.main_window.QMessageBox.warning",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.ui.main_window.QMessageBox.critical",
+        lambda parent, title, text: shown.update(title=title, text=text),
+    )
+
+    def refuse():
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(backup_service, "ensure_dirs", refuse)
+    window.create_backup_action()
+
+    assert shown["title"] == "Резервная копия"
+    assert "Permission denied" in shown["text"]
+    assert "права на запись" in shown["text"]
+    assert backup_service.list_backups(BACKUP_DIR) == []
+
+
+def test_restore_failure_does_not_close_the_program(qapp, window, issued_project,
+                                                    monkeypatch):
+    """Неожиданная ошибка восстановления не закрывает программу (ТЗ п.98)."""
+    monkeypatch.setattr(
+        "app.ui.main_window.QMessageBox.information",
+        lambda *args, **kwargs: None,
+    )
+    window.create_backup_action()
+    folder = backup_service.list_backups(BACKUP_DIR)[0]["path"]
+    monkeypatch.setattr(
+        "app.ui.main_window.QFileDialog.getExistingDirectory",
+        lambda *args, **kwargs: str(folder),
+    )
+    monkeypatch.setattr(
+        "app.ui.main_window.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox_Yes(),
+    )
+    shown = {}
+    monkeypatch.setattr(
+        "app.ui.main_window.QMessageBox.critical",
+        lambda parent, title, text: shown.update(title=title, text=text),
+    )
+
+    def refuse(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(backup_service, "restore_backup", refuse)
+    window.restore_backup_action()
+
+    assert "Восстановление не выполнено" == shown["title"]
+    assert "No space left on device" in shown["text"]
+    assert window.db is not None

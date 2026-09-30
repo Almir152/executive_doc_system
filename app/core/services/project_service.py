@@ -5,8 +5,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.models import (
-    ArchiveDocument, Document, DocumentVersion, HistoryEvent, Organization, Project,
-    ProjectSection, Representative, SectionKind,
+    ArchiveDocument, Direction, Document, DocumentVersion, HistoryEvent,
+    Organization, Project, ProjectSection, Representative, SectionKind,
 )
 
 
@@ -99,6 +99,48 @@ def delete_project(db: Session, project_id: int) -> None:
 
 def get_project(db: Session, project_id: int) -> Project | None:
     return db.get(Project, project_id)
+
+
+def create_project(
+    db: Session,
+    *,
+    title: str,
+    direction_id: int,
+    address: str | None = None,
+) -> Project:
+    """Создать проект (ТЗ п.17, 20).
+
+    Наименование и направление обязательны, адрес — нет: он входит в состав
+    карточки, но помечен как необязательный, и молчаливая подстановка
+    «Не указан» выдавала отсутствие данных за введённое значение.
+
+    Создание идёт через сервис, а не напрямую в интерфейсе: правила
+    обязательности и запись в историю должны быть одними и теми же, откуда
+    бы проект ни создавался.
+    """
+    if not title.strip():
+        raise ProjectError("Наименование проекта обязательно (ТЗ п.17).")
+    if db.get(Direction, direction_id) is None:
+        raise ProjectError(
+            f"Направление не найдено: {direction_id}. Сначала заведите его в "
+            "справочнике направлений (ТЗ п.14, 20)."
+        )
+
+    project = Project(
+        title=title.strip(),
+        direction_id=direction_id,
+        address=(address or "").strip() or None,
+    )
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+    record_event(
+        db, project.id, "project_created",
+        f"Создан проект: {project.title}",
+        entity_type="project", entity_id=project.id,
+    )
+    db.commit()
+    return project
 
 
 def update_project_card(

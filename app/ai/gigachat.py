@@ -193,12 +193,36 @@ def _post(url: str, payload: dict, headers: dict, timeout: int) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def basic_authorization(authorization_key: str) -> str:
+    """Значение заголовка ``Authorization: Basic`` по протоколу GigaChat.
+
+    Ключ авторизации из личного кабинета — уже Base64 от пары
+    ``Client ID:Client Secret``, поэтому в заголовке он передаётся как есть.
+    Повторное кодирование приводит к тому, что служба токенов получает вместо
+    пары Base64-строку и отвечает «cant decode authorization header».
+
+    Для оператора, который ввёл пару вручную, ключ кодируется один раз.
+    """
+    key = (authorization_key or "").strip()
+    if not key:
+        raise GigaChatError("Не задан ключ авторизации GigaChat")
+    if ":" in key:
+        key = base64.b64encode(key.encode("utf-8")).decode("ascii")
+    try:
+        key.encode("latin-1")
+    except UnicodeEncodeError as exc:
+        raise GigaChatError(
+            "Ключ авторизации содержит недопустимые символы. Скопируйте "
+            "его из личного кабинета целиком либо введите пару Client ID и "
+            "Client Secret через двоеточие — она будет закодирована сама."
+        ) from exc
+    return key
+
+
 def _token_request(authorization_key: str, scope: str, token_url: str,
                    timeout: int) -> dict:
     """Обменять ключ авторизации на access token."""
-    credentials = base64.b64encode(
-        f"{authorization_key}:".encode("utf-8")
-    ).decode("ascii")
+    credentials = basic_authorization(authorization_key)
     body = urllib.parse.urlencode({"scope": scope}).encode("ascii")
     status, raw = _send(
         token_url, body,
@@ -213,10 +237,7 @@ def _token_request(authorization_key: str, scope: str, token_url: str,
         timeout,
     )
     if status >= 400:
-        raise GigaChatError(
-            f"Ключ авторизации отклонён (код {status}): "
-            f"{raw[:400] or 'без пояснения'}"
-        )
+        raise GigaChatError(_token_rejection(status, raw))
     try:
         data = json.loads(raw)
     except ValueError as exc:
@@ -225,6 +246,36 @@ def _token_request(authorization_key: str, scope: str, token_url: str,
     if not token:
         raise GigaChatError("В ответе со службой токенов нет access_token")
     return data
+
+
+def _token_rejection(status: int, raw: str) -> str:
+    """Отказ службы токенов: причина и что делать оператору.
+
+    Служба отвечает по-английски и без указания, что не так с ключом, поэтому
+    текст переводится и дополняется конкретным действием: иначе оператор
+    ищет проблему в сети, хотя дело в способе ввода ключа.
+    """
+    reason = (raw or "").strip()
+    lowered = reason.lower()
+    if "cant decode" in lowered or "cannot decode" in lowered:
+        detail = (
+            "служба не смогла расшифровать заголовок авторизации. "
+            "Проверьте ключ: он должен быть скопирован из личного кабинета "
+            "целиком, без изменений"
+        )
+    elif "invalid_client" in lowered or "client" in lowered:
+        detail = (
+            "пара Client ID и Client Secret не распознана. Скопируйте "
+            "ключ авторизации заново из личного кабинета"
+        )
+    elif "scope" in lowered:
+        detail = (
+            "у ключа нет доступа к указанной области. Проверьте область "
+            "доступа в настройках ИИ"
+        )
+    else:
+        detail = "проверьте ключ авторизации и область доступа в настройках ИИ"
+    return f"Ключ авторизации отклонён (код {status}): {detail}. Ответ службы: {reason[:400] or 'без пояснения'}"
 
 
 class GigaChatProvider:

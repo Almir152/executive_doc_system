@@ -6,6 +6,7 @@
 пользователь видит, что окно не открылось, и не знает причины.
 """
 
+import logging
 import sys
 
 from PyQt6.QtWidgets import QApplication, QMessageBox
@@ -13,6 +14,43 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from app.config import setup_logging
 from app.db.database import init_db
 from app.ui.main_window import MainWindow
+
+CRASH_HINT = (
+    "Работа программы продолжена. Если действие не получилось, повторите его "
+    "и сообщите разработчику текст ошибки: подробности записаны в файл "
+    "app.log рядом с базой."
+)
+
+
+def install_crash_handler() -> None:
+    """Показывать необработанные ошибки вместо молчаливого закрытия окна.
+
+    Приложение собрано как оконное (--windowed, console=False), поэтому
+    необработанное исключение в слоте Qt закрывает программу без единого
+    слова на экране: оператор видит только исчезновение окна и не может
+    ни понять причину, ни переслать её разработчику. Именно так выглядел
+    отказ при создании резервной копии (ТЗ п.106: ошибка видна оператору).
+    """
+    def report(exc_type, exc_value, traceback_object) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, traceback_object)
+            return
+        logging.getLogger(__name__).error(
+            "Необработанная ошибка",
+            exc_info=(exc_type, exc_value, traceback_object),
+        )
+        box = QMessageBox(QMessageBox.Icon.Critical, "Ошибка программы", "")
+        box.setText(
+            f"{exc_type.__name__}: {exc_value}\n\n{CRASH_HINT}"
+        )
+        box.setInformativeText(
+            "Это ошибка в самой программе, а не в ваших данных. "
+            "Последнее действие не завершено."
+        )
+        box.exec()
+
+    sys.excepthook = report
+
 
 WAL_WARNING = (
     "Не удалось вернуть базе обычный режим работы.\n\n"
@@ -27,6 +65,7 @@ WAL_WARNING = (
 
 def main() -> int:
     setup_logging()
+    install_crash_handler()
     app = QApplication(sys.argv)
 
     try:

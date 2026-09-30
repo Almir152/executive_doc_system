@@ -19,11 +19,19 @@ import pytest
 
 from app.ai import provider_result, secrets
 from app.ai.connector import AIConnector, MODE_INTERNET, build_internet_provider
+from app.ai import gigachat
 from app.ai.gigachat import (
     CA_BUNDLE_ENV, DEFAULT_SCOPE, GigaChatConfig, GigaChatError,
     GigaChatProvider,
-    TOKEN_GUARD_SECONDS, ssl_context,
+    TOKEN_GUARD_SECONDS, basic_authorization, ssl_context,
 )
+
+#: Ключ авторизации в тестах — как в личном кабинете: Base64 от пары
+#: ``Client ID:Client Secret``, то есть ASCII без двоеточия. Такой вид ключа
+#: и должен уходить в заголовок без изменений.
+FAKE_AUTHORIZATION_KEY = base64.b64encode(
+    "идентификатор:секрет".encode("utf-8")
+).decode("ascii")
 
 
 # =====================================================================
@@ -242,25 +250,93 @@ def _config_with_url(base_url: str, token_url: str):
 
 
 def test_token_request_follows_documented_protocol(giga_server):
-    """Ключ уходит в Basic, область доступа — в тело, RqUID обязателен."""
-    provider = GigaChatProvider(GigaChatConfig(), "ключ-авторизации")
+    """Ключ из кабинета уходит в Basic без повторного кодирования.
+
+    Ключ авторизации — уже Base64 от ``Client ID:Client Secret``. Если
+    закодировать его повторно, служба токенов получает вместо пары Base64-
+    строку и отвечает «cant decode authorization header».
+    """
+    authorization_key = base64.b64encode(
+        "идентификатор:секрет".encode("utf-8")
+    ).decode("ascii")
+    provider = GigaChatProvider(GigaChatConfig(), authorization_key)
 
     token = provider.access_token()
 
     assert token.startswith("token-")
     call = giga_server.calls[0]
     assert call["path"].endswith("/oauth")
-    assert _header(call, "Authorization") == "Basic " + base64.b64encode(
-        "ключ-авторизации:".encode("utf-8")
-    ).decode("ascii")
+    assert _header(call, "Authorization") == "Basic " + authorization_key
     assert _header(call, "Content-Type") == "application/x-www-form-urlencoded"
     assert _header(call, "RqUID")
     assert f"scope={DEFAULT_SCOPE}" in call["body"]
 
 
+def test_manual_client_id_and_secret_are_encoded_once():
+    """Введённая вручную пара кодируется один раз, приёмник видит пару."""
+    encoded = basic_authorization("идентификатор:секрет")
+
+    assert encoded == base64.b64encode(
+        "идентификатор:секрет".encode("utf-8")
+    ).decode("ascii")
+    assert base64.b64decode(encoded).decode("utf-8") == "идентификатор:секрет"
+
+
+def test_key_from_cabinet_is_not_re_encoded():
+    """Ключ кабинета не трогаем: он уже готов к отправке."""
+    key = "MDFhMGYzZjgtMzRiZi03NTFlLTgyOTAtNGM5MGRkMWM0YjRhOjQyYWJkYjcz"
+
+    assert basic_authorization(key) == key
+    assert basic_authorization(f"  {key}\n") == key
+
+
+def test_empty_key_is_reported_before_request():
+    """Пустой ключ — понятная ошибка, а не запрос в сеть."""
+    with pytest.raises(GigaChatError, match="Не задан ключ"):
+        basic_authorization("   ")
+
+
+def test_undecodable_authorization_is_explained():
+    """Ответ службы про заголовок переводится и объясняет причину.
+
+    Без перевода оператор ищет проблему в сети, хотя неверно введён ключ.
+    """
+    error = gigachat._token_rejection(
+        401, '{"message": "cant decode authorization header"}'
+    )
+
+    assert "cant decode authorization header" in error
+    assert "из личного кабинета" in error
+    assert "401" in error
+
+
+def test_key_rejection_without_known_reason_is_generic():
+    """Неизвестный отказ не выдаётся за конкретную причину."""
+    error = gigachat._token_rejection(403, "forbidden")
+
+    assert "403" in error
+    assert "forbidden" in error
+    assert "из личного кабинета" not in error
+
+
+def test_rejected_key_message_reaches_the_operator(giga_server, monkeypatch):
+    """Текст отказа доходит до оператора, а не теряется внутри провайдера."""
+    monkeypatch.setattr(
+        gigachat, "_send",
+        lambda *args, **kwargs: (401, '{"message": "cant decode authorization header"}'),
+    )
+    provider = GigaChatProvider(GigaChatConfig(), FAKE_AUTHORIZATION_KEY)
+
+    result = provider({"request": "проверка"})
+
+    assert result["status"] == "error"
+    assert result["proposals"] == []
+    assert "из личного кабинета" in result["message"]
+
+
 def test_chat_request_uses_bearer_token_and_model(giga_server):
     """К модели обращаются с токеном, модель и сообщения — по протоколу."""
-    provider = GigaChatProvider(GigaChatConfig(), "ключ")
+    provider = GigaChatProvider(GigaChatConfig(), FAKE_AUTHORIZATION_KEY)
 
     text = provider.ask("Проверь комплектность.")
 
@@ -276,7 +352,7 @@ def test_expired_token_is_renewed(giga_server):
     """Токен живёт около 30 минут, поэтому запрашивается заново."""
     clock = {"now": 1000.0}
     provider = GigaChatProvider(
-        GigaChatConfig(), "ключ", clock=lambda: clock["now"]
+        GigaChatConfig(), FAKE_AUTHORIZATION_KEY, clock=lambda: clock["now"]
     )
     provider.ask("первый")
     clock["now"] += 1800 + 1
@@ -292,7 +368,7 @@ def test_token_is_not_reissued_before_it_expires(giga_server):
     """Живой токен повторно не обменивается."""
     clock = {"now": 1000.0}
     provider = GigaChatProvider(
-        GigaChatConfig(), "ключ", clock=lambda: clock["now"]
+        GigaChatConfig(), FAKE_AUTHORIZATION_KEY, clock=lambda: clock["now"]
     )
     provider.ask("первый")
     clock["now"] += 1800 - TOKEN_GUARD_SECONDS - 10
@@ -310,7 +386,7 @@ def test_rejected_key_is_reported_without_invented_answer(giga_server, monkeypat
         raise gigachat.GigaChatError("Ключ авторизации отклонён (код 401)")
 
     monkeypatch.setattr(gigachat, "_token_request", failing)
-    provider = GigaChatProvider(GigaChatConfig(), "неверный")
+    provider = GigaChatProvider(GigaChatConfig(), FAKE_AUTHORIZATION_KEY)
     result = provider({"request": "проверка"})
 
     assert result["status"] == "error"
@@ -330,7 +406,7 @@ def test_provider_refuses_without_key_and_model():
 
 def test_connector_calls_provider_in_internet_mode(giga_server):
     """Коннектор передаёт контекст провайдеру и возвращает его предложения."""
-    provider = GigaChatProvider(GigaChatConfig(), "ключ")
+    provider = GigaChatProvider(GigaChatConfig(), FAKE_AUTHORIZATION_KEY)
     connector = AIConnector(mode=MODE_INTERNET, provider=provider)
 
     result = connector.analyze({"request": "проверка", "documents": []})
@@ -357,7 +433,7 @@ def test_rejected_token_is_renewed_and_request_repeated(giga_server):
     """Сервис отклонил токен: ключ обменяем заново и повторим запрос один раз."""
     giga_server.chat_status = 401
     giga_server.chat_body = {"message": "токен недействителен"}
-    provider = GigaChatProvider(GigaChatConfig(), "ключ")
+    provider = GigaChatProvider(GigaChatConfig(), FAKE_AUTHORIZATION_KEY)
 
     calls = {"n": 0}
     original = provider._ask_once
@@ -389,7 +465,7 @@ def test_repeated_token_rejection_is_reported(giga_server):
     """Повторный отказ не превращается в правдоподобный ответ."""
     giga_server.chat_status = 401
     giga_server.chat_body = {"message": "токен недействителен"}
-    provider = GigaChatProvider(GigaChatConfig(), "ключ")
+    provider = GigaChatProvider(GigaChatConfig(), FAKE_AUTHORIZATION_KEY)
 
     result = provider({"request": "проверь комплектность", "files": []})
 
@@ -430,7 +506,7 @@ def test_request_goes_through_proxy_from_environment(monkeypatch):
                          "http://api.giga.invalid/api/v2/oauth"),
     )
     try:
-        provider = GigaChatProvider(GigaChatConfig(), "ключ")
+        provider = GigaChatProvider(GigaChatConfig(), FAKE_AUTHORIZATION_KEY)
         assert provider.access_token() == "token-через-прокси"
     finally:
         proxy.shutdown()
@@ -479,7 +555,7 @@ def test_untrusted_certificate_is_refused_with_explanation(self_signed, monkeypa
                          f"https://{host}:{port}/api/v2/oauth"),
     )
     try:
-        provider = GigaChatProvider(GigaChatConfig(), "ключ")
+        provider = GigaChatProvider(GigaChatConfig(), FAKE_AUTHORIZATION_KEY)
         with pytest.raises(GigaChatError) as failure:
             provider.access_token()
     finally:

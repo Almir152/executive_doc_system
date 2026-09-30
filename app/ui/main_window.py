@@ -1,10 +1,11 @@
+import logging
 import os
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QListWidget,
     QListWidgetItem,
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
-    QTextEdit, QMessageBox, QInputDialog, QStackedWidget, QFileDialog,
+    QTextEdit, QMessageBox, QStackedWidget, QFileDialog,
     QLineEdit, QFormLayout, QComboBox, QGroupBox
 )
 from PyQt6.QtCore import Qt
@@ -35,10 +36,13 @@ from app.core.services.printing import PrintError
 from app.core.domain import UnknownLinkRole
 from app.ui.package_dialog import PackageDialog
 from app.ui.directories_page import DirectoryPage
+from app.ui.project_dialog import ProjectCreateDialog
 from app.ui.project_window import ProjectWindow
 from app.core.services.project_service import (
-    ProjectError, can_delete_project, delete_project,
+    ProjectError, can_delete_project, create_project, delete_project,
 )
+
+log = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -158,8 +162,26 @@ class MainWindow(QMainWindow):
         self.btn_export = QPushButton("Экспорт комплекта (PDF)")
         self.btn_export.clicked.connect(self.export_project_pdf)
         btn_layout.addWidget(self.btn_export)
+
+        # Работа с документами идёт в отдельном окне проекта, которое до этого
+        # открывалось только двойным щелчком. Явная кнопка убирает целый класс
+        # ошибок приёмки, когда оператор искал «+ Документ» в главном окне
+        # (ТЗ п.16).
+        self.btn_open_project = QPushButton("Открыть рабочее окно проекта")
+        self.btn_open_project.setStyleSheet("background-color: #e6f7ff;")
+        self.btn_open_project.clicked.connect(self.open_project_window)
+        btn_layout.addWidget(self.btn_open_project)
+
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
+
+        hint = QLabel(
+            "Выберите проект в таблице и нажмите «Открыть рабочее окно проекта» "
+            "(или дважды щёлкните по строке). Разделы, документы, материалы, "
+            "связи с архивом, комплекты и печать форм находятся в этом окне."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
         self.projects_table = QTableWidget(0, 4)
         self.projects_table.setHorizontalHeaderLabels(["ID", "Направление", "Наименование", "Адрес"])
@@ -167,6 +189,8 @@ class MainWindow(QMainWindow):
         self.projects_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         # ТЗ п.16: рабочее окно проекта открывается из списка проектов.
         self.projects_table.itemDoubleClicked.connect(self.open_project_window)
+        # Выбор проекта в таблице — это и есть выбор проекта для ИИ.
+        self.projects_table.itemSelectionChanged.connect(self.refresh_ai_state)
         layout.addWidget(self.projects_table)
 
         return page
@@ -175,6 +199,11 @@ class MainWindow(QMainWindow):
         """Открыть рабочее окно проекта (ТЗ п.16)."""
         project_id = self.selected_project_id()
         if project_id is None:
+            # Молчаливый выход выглядел как «кнопка не работает».
+            QMessageBox.warning(
+                self, "Рабочее окно проекта",
+                "Сначала выберите проект в таблице.",
+            )
             return
         if self.project_window is not None:
             self.project_window.close()
@@ -276,6 +305,13 @@ class MainWindow(QMainWindow):
         self.ai_page_status = QLabel()
         self.ai_page_status.setStyleSheet("font-weight: bold;")
         layout.addWidget(self.ai_page_status)
+
+        # Текущий проект для ИИ выбирается в разделе «Проекты». Показываем его
+        # здесь явно: иначе оператор нажимал «Спросить ИИ» и получал только
+        # предупреждение, не понимая, где выбирается проект (ТЗ п.102).
+        self.ai_project_hint = QLabel()
+        self.ai_project_hint.setWordWrap(True)
+        layout.addWidget(self.ai_project_hint)
 
         # ТЗ п.102: оператор формулирует запрос словами («Проверь комплект
         # АОСР №15»), а агент сам выбирает нужные документы.
@@ -445,6 +481,11 @@ class MainWindow(QMainWindow):
         self.ai_key_edit.setPlaceholderText(
             "Ключ авторизации GigaChat (сохраняется в защищённом хранилище)"
         )
+        self.ai_key_edit.setToolTip(
+            "Ключ копируется из личного кабинета целиком и вводится без "
+            "изменений — кодировать его не нужно. Если вводите пару вручную, "
+            "укажите «Client ID:Client Secret» через двоеточие."
+        )
         form_ai.addRow("Ключ GigaChat:", self.ai_key_edit)
         self.ai_key_state = QLabel()
         self.ai_key_state.setWordWrap(True)
@@ -475,6 +516,9 @@ class MainWindow(QMainWindow):
     def on_nav_changed(self, row: int):
         self.stack.setCurrentIndex(row)
         self.title_label.setText(f"Рабочая область: {self.nav_list.item(row).text()}")
+        # Подсказка о текущем проекте на странице ИИ должна отражать выбор,
+        # сделанный в «Проектах».
+        self.refresh_ai_state()
 
     def selected_project_id(self) -> int | None:
         """ID выбранного проекта или None, если проект не выбран."""
@@ -772,6 +816,23 @@ class MainWindow(QMainWindow):
                 label.setText(text)
                 label.setStyleSheet(f"color: {color}; font-weight: bold;")
 
+        project_id = self.selected_project_id()
+        if getattr(self, "ai_project_hint", None) is not None:
+            if project_id is None:
+                self.ai_project_hint.setText(
+                    "Проект не выбран. Откройте «Проекты», выберите строку и "
+                    "вернитесь сюда — ИИ работает с выбранным проектом "
+                    "(ТЗ п.102)."
+                )
+                self.ai_project_hint.setStyleSheet("color: #990000;")
+            else:
+                project = self.db.get(Project, project_id)
+                title = project.title if project is not None else f"№{project_id}"
+                self.ai_project_hint.setText(
+                    f"Текущий проект: {title}. Сменить — в разделе «Проекты»."
+                )
+                self.ai_project_hint.setStyleSheet("")
+
         if getattr(self, "ai_output", None) is not None:
             self.ai_output.setVisible(self.ai.enabled)
         if getattr(self, "btn_run_ai", None) is not None:
@@ -780,34 +841,34 @@ class MainWindow(QMainWindow):
             self.ai_output.clear()
 
     def add_project(self):
-        title, ok1 = QInputDialog.getText(self, "Новый проект", "Введите наименование проекта:")
-        if not ok1 or not title.strip():
-            return
-
         # Направление выбирается из справочника (ТЗ п.14, 20), а не из
         # захардкоженного списка: справочник редактируется оператором.
-        directions = self.db.query(Direction).order_by(Direction.sort_order).all()
-        if not directions:
+        if not self.db.query(Direction).first():
             QMessageBox.critical(
                 self, "Справочник пуст",
                 "Справочник направлений не заполнен. Перезапустите приложение.",
             )
             return
-        names = [d.name for d in directions]
-        direction, ok2 = QInputDialog.getItem(
-            self, "Направление", "Выберите направление работ:", names, 0, False
-        )
-        if not ok2:
-            return
 
-        direction_row = self.db.query(Direction).filter(Direction.name == direction).one()
-        proj = Project(
-            title=title.strip(),
-            direction_id=direction_row.id,
-            address="Не указан",
-        )
-        self.db.add(proj)
-        self.db.commit()
+        dialog = ProjectCreateDialog(self.db, self)
+        if not dialog.exec():
+            return
+        values = dialog.values()
+        if not (values["title"] or "").strip():
+            QMessageBox.warning(
+                self, "Новый проект", "Укажите наименование проекта."
+            )
+            return
+        if values["direction_id"] is None:
+            QMessageBox.warning(
+                self, "Новый проект", "Выберите направление работ."
+            )
+            return
+        try:
+            create_project(self.db, **values)
+        except ProjectError as exc:
+            QMessageBox.critical(self, "Новый проект", str(exc))
+            return
         self.load_projects()
 
     def delete_project(self):
@@ -1216,9 +1277,34 @@ class MainWindow(QMainWindow):
         except backup_service.BackupError as exc:
             QMessageBox.critical(self, "Резервная копия", str(exc))
             return
-        self.load_backups()
-        problems = backup_service.verify_backup(folder)
-        text = backup_service.describe_backup(folder)
+        except Exception as exc:  # noqa: BLE001 - окно важнее падения
+            # Сюда попадает всё, что сервис не описал. Молча закрывать
+            # программу нельзя: оператор должен увидеть причину.
+            log.exception("Не удалось создать резервную копию")
+            QMessageBox.critical(
+                self,
+                "Резервная копия",
+                f"Не удалось создать резервную копию.\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                "Подробности записаны в файл app.log рядом с базой.",
+            )
+            return
+        # Чтение и проверка только что созданной копии тоже могут упасть
+        # (диск отключили, файл занят): это не должно закрывать программу.
+        try:
+            self.load_backups()
+            problems = backup_service.verify_backup(folder)
+            text = backup_service.describe_backup(folder)
+        except Exception as exc:  # noqa: BLE001 - окно важнее падения
+            log.exception("Не удалось проверить созданную копию")
+            QMessageBox.warning(
+                self,
+                "Резервная копия",
+                f"Копия создана, но проверить её не удалось.\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                f"Папка: {folder}",
+            )
+            return
         if problems:
             QMessageBox.warning(
                 self,
@@ -1283,6 +1369,18 @@ class MainWindow(QMainWindow):
                 self,
                 "Восстановление не выполнено",
                 f"{exc}\n\nРабочие данные не изменены.",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - окно важнее падения
+            log.exception("Восстановление из копии прервано ошибкой")
+            self.db = SessionLocal()
+            QMessageBox.critical(
+                self,
+                "Восстановление не выполнено",
+                f"Восстановление прервано ошибкой.\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                "Рабочие данные не изменены, прежние данные отложены в папку "
+                "копий. Подробности записаны в файл app.log рядом с базой.",
             )
             return
         self.db = SessionLocal()

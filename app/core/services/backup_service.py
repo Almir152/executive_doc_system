@@ -113,19 +113,20 @@ def create_backup(
     if db is not None:
         _ensure_session_saved(db)
     db_path = Path(db_path)
-    ensure_dirs()
-    if not db_path.is_file():
-        raise BackupError(f"Файл базы не найден: {db_path}")
-
-    root = Path(base_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    folder = root / next_backup_folder(root)
-    staging = root / f".{folder}.сборка"
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
-
+    staging: Path | None = None
     try:
+        ensure_dirs()
+        if not db_path.is_file():
+            raise BackupError(f"Файл базы не найден: {db_path}")
+
+        root = Path(base_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        folder = root / next_backup_folder(root)
+        staging = root / f".{folder}.сборка"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+
         snapshot = staging / DB_NAME
         _snapshot_database(db_path, snapshot)
         # Описание копии и файлы берутся из снимка: манифест обязан
@@ -141,9 +142,31 @@ def create_backup(
         folder.mkdir(parents=True, exist_ok=False)
         for item in sorted(staging.iterdir()):
             shutil.move(str(item), str(folder / item.name))
+    except OSError as exc:
+        # Файловая ошибка не должна доходить до слота Qt: необработанное
+        # исключение там закрывает приложение целиком, и оператор видит
+        # только исчезновение окна без объяснения (ТЗ п.98).
+        raise BackupError(_storage_problem("создать резервную копию", exc)) from exc
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        # staging может быть не создан: тогда удалять нечего, а попытка
+        # удалить None упала бы в обход except OSError.
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
     return folder
+
+
+def _storage_problem(action: str, exc: Exception) -> str:
+    """Файловая ошибка хранилища как текст для оператора.
+
+    Формулировки системных исключений на английском и без указания на папку,
+    поэтому к ним добавляется название операции и то, что оператор может
+    сделать: проверить права и свободное место.
+    """
+    return (
+        f"Не удалось {action}: {exc}\n\n"
+        "Проверьте, что у папки программы есть права на запись и на диске "
+        "свободно место. Рабочие данные не изменены."
+    )
 
 
 def _ensure_session_saved(db: Session) -> None:
@@ -541,29 +564,34 @@ def restore_backup(
             "копия проекта (ТЗ п.72, 74)."
         )
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    _ensure_database_not_busy(db_path)
-    # Текущие данные сохраняются: восстановление обратимо.
-    safety = _make_safety_copy(safety_dir, db_path, archive_dir, settings_path)
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_database_not_busy(db_path)
+        # Текущие данные сохраняются: восстановление обратимо.
+        safety = _make_safety_copy(safety_dir, db_path, archive_dir, settings_path)
 
-    _install_database(backup_path / manifest.get("database", DB_NAME), db_path, manifest,
-                      archive_dir)
-    _restore_files(backup_path / FILES_DIR, archive_dir)
-    if manifest.get("settings_included") and (backup_path / SETTINGS_NAME).is_file():
-        shutil.copy2(backup_path / SETTINGS_NAME, settings_path)
+        _install_database(backup_path / manifest.get("database", DB_NAME), db_path, manifest,
+                          archive_dir)
+        _restore_files(backup_path / FILES_DIR, archive_dir)
+        if manifest.get("settings_included") and (backup_path / SETTINGS_NAME).is_file():
+            shutil.copy2(backup_path / SETTINGS_NAME, settings_path)
 
-    # Файлы, которых нет в копии, в восстановленном архиве лишние: база на
-    # них не ссылается, и оператор увидел бы их как «чужие».
-    expected = {
-        (archive_dir / entry["relative"]).resolve()
-        for entry in manifest.get("files", [])
-        if not _unsafe_relative(entry.get("relative", ""))
-    }
-    for path in sorted(archive_dir.rglob("*")):
-        if path.is_file() and path.resolve() not in expected:
-            path.unlink()
-    _prune_empty_dirs(archive_dir)
+        # Файлов, которых нет в копии, в восстановленном архиве лишние: база
+        # на них не ссылается, и оператор увидел бы их как чужие.
+        expected = {
+            (archive_dir / entry["relative"]).resolve()
+            for entry in manifest.get("files", [])
+            if not _unsafe_relative(entry.get("relative", ""))
+        }
+        for path in sorted(archive_dir.rglob("*")):
+            if path.is_file() and path.resolve() not in expected:
+                path.unlink()
+        _prune_empty_dirs(archive_dir)
+    except OSError as exc:
+        # Файловая ошибка не должна доходить до слота Qt: там необработанное
+        # исключение закрывает приложение целиком (ТЗ п.98).
+        raise BackupError(_storage_problem("восстановить из копии", exc)) from exc
     return safety
 
 
