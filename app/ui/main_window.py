@@ -14,9 +14,10 @@ from app.core import domain
 from app.db.database import (
     SessionLocal, init_db, pending_update_migrations, release_database,
 )
-from app.db.models import Direction, Project, Document
+from app.db.models import Direction, Project
+from app.ai import normative
 from app.ai.connector import AIConnector, MODE_LABELS, MODE_ORDER
-from app.core.services import backup_service, storage_service
+from app.core.services import ai_service, backup_service, storage_service
 from app.core.services.storage_service import (
     ARCHIVE_CATEGORIES, ARCHIVE_CATEGORY_DEFAULT, StorageError, add_file_to_archive,
     calculate_hash, find_by_hash,
@@ -263,13 +264,54 @@ class MainWindow(QMainWindow):
         self.ai_page_status.setStyleSheet("font-weight: bold;")
         layout.addWidget(self.ai_page_status)
 
-        self.btn_run_ai = QPushButton("Запустить ИИ-анализ проекта")
+        # ТЗ п.102: оператор формулирует запрос словами («Проверь комплект
+        # АОСР №15»), а агент сам выбирает нужные документы.
+        request_row = QHBoxLayout()
+        self.ai_request_input = QLineEdit()
+        self.ai_request_input.setPlaceholderText(
+            "Например: Проверь комплект АОСР №15"
+        )
+        self.ai_request_input.returnPressed.connect(self.run_ai_check)
+        request_row.addWidget(self.ai_request_input)
+        self.btn_run_ai = QPushButton("Спросить ИИ")
         self.btn_run_ai.clicked.connect(self.run_ai_check)
-        layout.addWidget(self.btn_run_ai)
+        request_row.addWidget(self.btn_run_ai)
+        layout.addLayout(request_row)
+
+        # ТЗ п.105: результат ИИ — черновик, а не исполнительный документ.
+        draft_hint = QLabel(
+            "Предложения ИИ сохраняются как черновики. Они не являются "
+            "выпущенными документами и ничего не меняют, пока оператор не "
+            "подтвердит применение (ТЗ п.104, 105)."
+        )
+        draft_hint.setWordWrap(True)
+        layout.addWidget(draft_hint)
 
         self.ai_output = QTextEdit()
         self.ai_output.setReadOnly(True)
+        self.ai_output.setMaximumHeight(110)
         layout.addWidget(self.ai_output)
+
+        self.ai_table = QTableWidget(0, 4)
+        self.ai_table.setHorizontalHeaderLabels(
+            ["Предложение", "Основание", "Черновик", "Статус"]
+        )
+        self.ai_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.ai_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.ai_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        layout.addWidget(self.ai_table)
+
+        actions = QHBoxLayout()
+        self.btn_apply_proposal = QPushButton("Применить предложение")
+        self.btn_apply_proposal.clicked.connect(self.apply_ai_proposal)
+        actions.addWidget(self.btn_apply_proposal)
+        self.btn_reject_proposal = QPushButton("Отклонить")
+        self.btn_reject_proposal.clicked.connect(self.reject_ai_proposal)
+        actions.addWidget(self.btn_reject_proposal)
+        actions.addStretch()
+        layout.addLayout(actions)
 
         self.refresh_ai_state()
         return page
@@ -748,31 +790,121 @@ class MainWindow(QMainWindow):
         return box.clickedButton() is finish
 
     def run_ai_check(self):
-        if not self.ai.enabled:
-            self.ai_output.clear()
-            return
+        """Спросить ИИ по проекту (ТЗ п.102).
 
+        Агент получает только контекст, собранный системой (ТЗ п.103), а его
+        предложения сохраняются черновиками (ТЗ п.105).
+        """
+        if not self.ai.enabled:
+            self.ai_output.setText("ИИ выключен. Включите его в настройках.")
+            return
         project_id = self.selected_project_id()
         if project_id is None:
-            QMessageBox.warning(self, "ИИ-анализ", "Выберите проект в разделе «Проекты».")
+            QMessageBox.warning(
+                self, "ИИ-агент",
+                "Выберите проект в разделе «Проекты»: ИИ работает с проектом "
+                "и его документами (ТЗ п.102).",
+            )
             return
-        doc_ids = [
-            d.id for d in
-            self.db.query(Document).filter(Document.project_id == project_id).all()
-        ]
+        request = self.ai_request_input.text().strip()
+        if not request:
+            request = "Проверь комплект проекта"
+        try:
+            result = ai_service.analyze(self.db, project_id, request, self.ai)
+        except (ai_service.AiError, ValueError) as exc:
+            QMessageBox.critical(self, "ИИ-агент", str(exc))
+            return
+        answer = result["answer"]
+        from app.ai.context import describe_context
 
-        res = self.ai.analyze_package(doc_ids)
-        out = (
-            f"Результат анализа ИИ ({self.ai.mode_label})\n"
-            f"Проект: ID {project_id}, документов: {len(doc_ids)}\n"
-            f"Статус: {res.get('status')}\n\nПредложения:\n"
+        text = (
+            f"Режим: {self.ai.mode_label}. Статус: {answer.get('status')}\n"
+            f"Контекст: {describe_context(result['context'])}\n"
+            f"Найдено предложений: {len(result['proposals'])}\n"
+            "Все предложения — черновики; применение — только по подтверждению "
+            "оператора (ТЗ п.104, 105)."
         )
-        for p in res.get("proposals", []):
-            if isinstance(p, dict):
-                out += f"• [{p.get('code')}] {p.get('text')}\n"
-            else:
-                out += f"• {p}\n"
-        self.ai_output.setText(out)
+        if answer.get("message"):
+            text += f"\n{answer['message']}"
+        self.ai_output.setText(text)
+        self.load_ai_proposals(project_id)
+
+    def load_ai_proposals(self, project_id: int):
+        """Показать предложения ИИ по проекту (ТЗ п.105)."""
+        proposals = ai_service.list_proposals(self.db, project_id)
+        self.ai_table.setRowCount(0)
+        for proposal in proposals:
+            row = self.ai_table.rowCount()
+            self.ai_table.insertRow(row)
+            item = QTableWidgetItem(f"{proposal.code}: {proposal.text}")
+            item.setData(Qt.ItemDataRole.UserRole, proposal.id)
+            self.ai_table.setItem(row, 0, item)
+            self.ai_table.setItem(
+                row, 1, QTableWidgetItem(normative.format_basis(proposal.basis))
+            )
+            self.ai_table.setItem(
+                row, 2,
+                QTableWidgetItem(
+                    "требование нормы" if proposal.is_requirement else "наблюдение"
+                ),
+            )
+            self.ai_table.setItem(row, 3, QTableWidgetItem(proposal.status))
+
+    def _selected_ai_proposal_id(self) -> int | None:
+        """ID выбранного предложения ИИ или None (ТЗ п.104)."""
+        rows = self.ai_table.selectionModel().selectedRows() if self.ai_table.selectionModel() else []
+        if not rows:
+            return None
+        item = self.ai_table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def apply_ai_proposal(self):
+        """Подтвердить предложение ИИ и применить через API (ТЗ п.104)."""
+        proposal_id = self._selected_ai_proposal_id()
+        if proposal_id is None:
+            QMessageBox.information(
+                self, "Предложение ИИ",
+                "Выберите предложение в таблице (ТЗ п.104).",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Применение предложения ИИ (ТЗ п.104)",
+            "Изменение выполнит система через свои проверки.\n"
+            "Продолжить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            proposal = ai_service.accept(self.db, proposal_id)
+        except ai_service.AiError as exc:
+            QMessageBox.warning(self, "Предложение не применено", str(exc))
+            return
+        self.load_ai_proposals(proposal.project_id)
+        QMessageBox.information(
+            self, "Предложение применено",
+            f"{proposal.decision_note or 'Изменение выполнено'} (ТЗ п.104).",
+        )
+
+    def reject_ai_proposal(self):
+        """Отклонить предложение ИИ (ТЗ п.104)."""
+        proposal_id = self._selected_ai_proposal_id()
+        if proposal_id is None:
+            QMessageBox.information(
+                self, "Предложение ИИ",
+                "Выберите предложение в таблице (ТЗ п.104).",
+            )
+            return
+        try:
+            proposal = ai_service.reject(self.db, proposal_id)
+        except ai_service.AiError as exc:
+            QMessageBox.warning(self, "Предложение", str(exc))
+            return
+        self.load_ai_proposals(proposal.project_id)
 
     # -----------------------------------------------------------------
     # РЕЗЕРВНОЕ КОПИРОВАНИЕ (ТЗ п.74, 98)

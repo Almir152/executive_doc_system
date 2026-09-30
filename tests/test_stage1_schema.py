@@ -698,6 +698,7 @@ def test_migration_of_already_migrated_database_adds_only_new_steps(tmp_path):
         "restore_version_number_uniqueness",
         "document_dates_and_links",
         "material_test_act_links",
+        "ai_proposals",
     ], f"неожиданный набор шагов: {applied}"
 
     raw = own_engine.raw_connection()
@@ -1036,7 +1037,7 @@ def test_migration_003_protects_issued_versions_of_legacy_v2_database(tmp_path):
 
     assert apply_migrations(own_engine) == [
         "protect_issued_document_versions", "restore_version_number_uniqueness",
-        "document_dates_and_links", "material_test_act_links",
+        "document_dates_and_links", "material_test_act_links", "ai_proposals",
     ]
 
     raw = sqlite3.connect(db_path)

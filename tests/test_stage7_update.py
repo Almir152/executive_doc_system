@@ -24,6 +24,12 @@ from app.db.models import (
 )
 
 PREVIOUS_SCHEMA_VERSION = 5
+#: Обе миграции, следующие за версией 5: 006 — связи с актами испытаний,
+#: 007 — предложения ИИ. Обновление применяет их обе (ТЗ п.97).
+PENDING_AFTER_PREVIOUS = [
+    "006 material_test_act_links",
+    "007 ai_proposals",
+]
 
 
 @pytest.fixture
@@ -69,7 +75,10 @@ def previous_release(db, project):
     )
 
     # Возвращаем базу к прежней версии: таблица следующей миграции ещё нет.
+    from app.db.models import AiProposal
+
     MaterialTestActLink.__table__.drop(db.get_bind())
+    AiProposal.__table__.drop(db.get_bind())
     raw = db.get_bind().raw_connection()
     try:
         migrations.set_user_version(raw, PREVIOUS_SCHEMA_VERSION)
@@ -98,11 +107,9 @@ def _counts(db) -> dict:
 def test_update_applies_pending_migration(db, previous_release):
     """Структура базы меняется только через миграцию (ТЗ п.97)."""
     engine = db.get_bind()
-    assert migrations.pending_for_engine(engine) == [
-        "006 material_test_act_links"
-    ]
+    assert migrations.pending_for_engine(engine) == PENDING_AFTER_PREVIOUS
     applied = migrations.apply_migrations(engine)
-    assert applied == ["material_test_act_links"]
+    assert applied == ["material_test_act_links", "ai_proposals"]
     assert migrations.get_user_version(
         engine.raw_connection().driver_connection
     ) == migrations.SCHEMA_VERSION

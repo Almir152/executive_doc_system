@@ -177,6 +177,9 @@ class Project(Base):
     history_events = relationship(
         "HistoryEvent", back_populates="project", cascade="all, delete-orphan"
     )
+    ai_proposals = relationship(
+        "AiProposal", back_populates="project", cascade="all, delete-orphan"
+    )
 
     def __repr__(self):
         return f"<Project {self.title}>"
@@ -846,4 +849,42 @@ class HistoryEvent(Base):
 
     __table_args__ = (
         Index('ix_history_project_time', 'project_id', 'created_at'),
+    )
+
+
+class AiProposal(Base):
+    """Предложение ИИ-агента: черновик, а не исполнительный документ.
+
+    ТЗ п.104, 105: по умолчанию ИИ ничего критического не меняет. Его
+    результат сохраняется здесь как черновик, и лишь после подтверждения
+    оператора изменение выполняется через прикладной API сервисов.
+
+    Поле ``action`` описывает, что именно предлагается изменить (например,
+    связать два документа). ``None`` означает замечание без изменения
+    данных. ``basis`` хранит основание нормы: документ, раздел, пункт
+    (ТЗ п.106); без основания предложение не выдаётся за требование.
+    """
+
+    __tablename__ = 'ai_proposals'
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(
+        Integer, ForeignKey('projects.id', ondelete="CASCADE"), nullable=False
+    )
+    document_id = Column(Integer, ForeignKey('documents.id', ondelete="SET NULL"))
+    code = Column(String, nullable=False)
+    text = Column(Text, nullable=False)
+    action = Column(JSON)
+    basis = Column(JSON)
+    is_requirement = Column(Boolean, nullable=False, default=False)
+    status = Column(String, nullable=False, default=domain.AI_PROPOSAL_DRAFT)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    decided_at = Column(DateTime)
+    decision_note = Column(Text)
+
+    project = relationship("Project", back_populates="ai_proposals")
+    document = relationship("Document", lazy="selectin")
+
+    __table_args__ = (
+        Index('ix_ai_proposals_project_status', 'project_id', 'status'),
     )

@@ -2,13 +2,14 @@
 
 Проверяет то, что действительно реализовано на текущем этапе:
 справочники -> проект -> документы -> архив без дублирования -> версии ->
-связи с ролями -> AI Connector -> выгрузка реестра -> миграция схемы.
+связи с ролями -> ИИ-агент по запросу -> выгрузка реестра -> миграция схемы.
 
 Проверка идёт в отдельном временном каталоге: рабочее хранилище оператора
 не затрагивается. Своё значение EXECUTIVE_DOC_DATA_DIR скрипт уважает.
 
-Не реализовано и потому не проверяется (см. этапы 6-7):
-обновление через миграции существующей базы и ИИ-контекст по запросу.
+Проверяются также обновление базы через миграции и работа ИИ-агента:
+запрос оператора, черновики, применение по подтверждению и нормативные
+основания (ТЗ п.74, 97, 101-106).
 """
 
 import os
@@ -22,6 +23,8 @@ os.environ.setdefault(
     "EXECUTIVE_DOC_DATA_DIR", str(Path(_TMP_DIR.name) / "storage")
 )
 
+from app import config as app_config  # noqa: E402
+from app.ai import context as ai_context, normative  # noqa: E402
 from app.config import BACKUP_DIR, DATA_DIR, PACKAGES_DIR, ensure_dirs  # noqa: E402
 from app.core import domain  # noqa: E402
 from app.core.services import backup_service  # noqa: E402
@@ -249,15 +252,65 @@ def main() -> int:
     check("нет нарушений внешних ключей", check_integrity() == [])
     check("нет осиротевших файлов архива", find_orphan_files(db) == [])
 
-    # --- AI Connector ---
+    # --- ИИ-агент: запрос, черновики, подтверждение (ТЗ п.101-106) ---
     from app.ai.connector import AIConnector
+    from app.core.services import ai_service
+
+    # Итоговый акт без связи — типичная ситуация: система предлагает
+    # связать его с актом скрытых работ, но только после подтверждения.
+    document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO, number="1"
+    )
+    db.commit()
 
     ai = AIConnector(mode="LOCAL")
-    analysis = ai.analyze_package([aosr1.id, aosr2.id])
+    result = ai_service.analyze(
+        db, project.id, "Проверь комплект АОСР №1", ai
+    )
+    analysis = result["answer"]
     print(f"\n[+] AI Connector ({ai.mode_label}) статус: {analysis['status']}")
-    check("AI Connector отвечает", "proposals" in analysis)
-    for proposal in analysis["proposals"]:
-        print(f"    Предложение ИИ: {proposal}")
+    print(f"    Контекст запроса: {result['context']['request']}")
+    check("ИИ работает по контексту проекта (ТЗ п.103)",
+          set(result["context"]) == set(ai_context.CONTEXT_KEYS))
+    check("пути файлов в контекст не попали (ТЗ п.103)",
+          str(app_config.ARCHIVE_DIR) not in repr(result["context"]))
+    drafts = result["proposals"]
+    check("предложения сохранены черновиками (ТЗ п.105)",
+          bool(drafts) and all(
+              item.status == domain.AI_PROPOSAL_DRAFT for item in drafts
+          ))
+    for proposal in drafts:
+        print(f"    Черновик ИИ: [{proposal.code}] {proposal.text}")
+        if proposal.basis:
+            print(f"        основание: {normative.format_basis(proposal.basis)}")
+
+    links_before = db.query(DocumentLink).count()
+    check("анализ ничего не изменил (ТЗ п.104)",
+          db.query(DocumentLink).count() == links_before)
+
+    applicable = [item for item in drafts if item.action]
+    if applicable:
+        proposal = applicable[0]
+        ai_service.accept(db, proposal.id)
+        check("подтверждённое предложение применено через сервис (ТЗ п.104)",
+              proposal.status == domain.AI_PROPOSAL_ACCEPTED)
+        try:
+            ai_service.accept(db, proposal.id)
+            check("повторное применение запрещено (ТЗ п.104)", False)
+        except ai_service.AiError:
+            check("повторное применение запрещено (ТЗ п.104)", True)
+    else:
+        check("предложений к применению нет: все наблюдения", True)
+
+    remaining = [
+        item for item in ai_service.list_proposals(db, project.id)
+        if item.status == domain.AI_PROPOSAL_DRAFT
+    ]
+    if remaining:
+        ai_service.reject(db, remaining[0].id, "требует проверки инженером")
+        check("отклонённое предложение не применено (ТЗ п.104)",
+              db.query(DocumentLink).count() >= links_before)
+
 
     # --- Выгрузка комплекта ---
     # Демонстрационные документы не выпущены: комплект выгружается с
@@ -448,8 +501,7 @@ def main() -> int:
     db.close()
 
     print("\n=== НЕ РЕАЛИЗОВАНО ===")
-    print("  - обновление через миграции (п.97)")
-    print("  - ИИ: контекст по запросу, черновики и подтверждение (п.101-106)")
+    print("  - интернет-ИИ без настроенной модели сообщает not_configured (п.101)")
 
     if FAILURES:
         print(f"\n=== ПРОВЕРКА НЕ ПРОЙДЕНА: {len(FAILURES)} ===")

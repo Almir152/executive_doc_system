@@ -1,8 +1,13 @@
-"""AI Connector — граница между приложением и ИИ (ТЗ п.5, 6).
+"""AI Connector — граница между приложением и ИИ (ТЗ п.5, 6, 9, 101).
 
 ИИ не имеет прямого доступа к SQLite, файловой системе или исходному коду.
 Всё взаимодействие идёт только через разрешённые инструменты прикладного слоя
 и требует подтверждения оператора (ТЗ п.11).
+
+ИИ — заменяемый компонент (ТЗ п.101): приложение знает только этот контракт.
+Коннектор получает готовый контекст (ТЗ п.103) и возвращает предложения;
+ни один из режимов не меняет данные сам — это делает прикладной API после
+подтверждения оператора (ТЗ п.104).
 """
 
 # ТЗ п.9: три режима работы.
@@ -27,17 +32,32 @@ MODE_COLORS = {
 
 MODE_ORDER = (MODE_LOCAL, MODE_INTERNET, MODE_OFF)
 
+STATUS_DISABLED = "disabled"
+STATUS_SUCCESS = "success"
+STATUS_NOT_CONFIGURED = "not_configured"
+
 
 class AIConnector:
     """Точка входа для ИИ-агента.
 
-    Реализация анализа появится в Этапе 7. Здесь зафиксирован контракт:
-    режимы, безопасный статус ответа и отсутствие любых прямых обращений
-    к хранилищу.
+    Локальный режим работает как набор проверок над контекстом: он
+    предсказуем, ничего не выдумывает и не требует внешних сервисов.
+    Интернет-режим без настроенного провайдера честно сообщает об этом,
+    а не изображает анализ (ТЗ п.101, 106).
     """
 
-    def __init__(self, mode: str = MODE_OFF):
-        self.mode = mode if mode in MODES else MODE_OFF
+    def __init__(self, mode: str = MODE_OFF, provider=None):
+        self._mode = mode if mode in MODES else MODE_OFF
+        self.provider = provider
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @mode.setter
+    def mode(self, value: str) -> None:
+        """Неизвестный режим выключает ИИ, а не ломает интерфейс (ТЗ п.9)."""
+        self._mode = value if value in MODES else MODE_OFF
 
     @property
     def enabled(self) -> bool:
@@ -50,19 +70,54 @@ class AIConnector:
     def mode_color(self) -> str:
         return MODE_COLORS[self.mode]
 
-    def analyze_package(self, document_ids: list) -> dict:
-        """Запрос интеллектуальной проверки комплекта (ТЗ п.102).
+    def analyze(self, context: dict) -> dict:
+        """Проверить контекст проекта и вернуть предложения (ТЗ п.102).
 
-        Возвращает только предложения. Применение чего-либо — отдельный шаг,
-        требующий подтверждения оператора.
+        Возвращает только предложения: ни одно изменение данных здесь не
+        происходит (ТЗ п.104).
         """
         if not self.enabled:
-            return {"status": "disabled", "message": "ИИ выключен", "proposals": []}
+            return {
+                "status": STATUS_DISABLED,
+                "message": "ИИ выключен: включите его в настройках (ТЗ п.9).",
+                "mode": self.mode,
+                "proposals": [],
+            }
+        if self.provider is not None:
+            return self.provider(context)
+        if self.mode == MODE_INTERNET:
+            return {
+                "status": STATUS_NOT_CONFIGURED,
+                "message": (
+                    "Интернет-ИИ не настроен: не задана модель и не подключён "
+                    "провайдер. Документы и проект не передавались наружу "
+                    "(ТЗ п.101)."
+                ),
+                "mode": self.mode,
+                "proposals": [],
+            }
+        from app.ai.rules import analyze_context
 
         return {
-            "status": "success",
+            "status": STATUS_SUCCESS,
             "mode": self.mode,
-            "proposals": [
-                "Проверьте дату АООК: дата завершения должна быть не раньше АОСР."
-            ],
+            "message": "",
+            "proposals": analyze_context(context),
+        }
+
+    def analyze_package(self, document_ids: list) -> dict:
+        """Совместимость с прежним вызовом интерфейса (ТЗ п.102).
+
+        Идентификаторы документов без контекста проверить нечем, поэтому
+        возвращается честный отказ с пояснением вместо правдоподобного
+        текста (ТЗ п.106).
+        """
+        return {
+            "status": STATUS_NOT_CONFIGURED,
+            "message": (
+                "Для проверки нужен контекст проекта: выберите проект и "
+                "сформулируйте запрос (ТЗ п.102, 103)."
+            ),
+            "document_ids": list(document_ids or []),
+            "proposals": [],
         }

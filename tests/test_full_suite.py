@@ -83,16 +83,29 @@ def test_ai_connector_three_modes_per_tz_9():
 
 
 def test_ai_connector_off_returns_disabled():
-    res = AIConnector(mode=MODE_OFF).analyze_package([1, 2])
+    res = AIConnector(mode=MODE_OFF).analyze({"documents": []})
     assert res["status"] == "disabled"
     assert res["proposals"] == []
 
 
 def test_ai_connector_local_returns_proposals():
-    res = AIConnector(mode=MODE_LOCAL).analyze_package([1, 2])
+    """Локальный режим проверяет переданный контекст (ТЗ п.102, 103)."""
+    context = {
+        "documents": [{"id": 1, "type": "АОСР", "type_label": "АОСР", "number": "1",
+                       "issued": False, "status": "draft", "period": {}}],
+        "links": [], "archive": [], "materials": [], "normative": [],
+    }
+    res = AIConnector(mode=MODE_LOCAL).analyze(context)
     assert res["status"] == "success"
     assert res["mode"] == MODE_LOCAL
     assert len(res["proposals"]) > 0
+
+
+def test_ai_connector_internet_without_provider_is_honest():
+    """Без настроенной модели интернет-режим не изображает анализ (ТЗ п.101)."""
+    res = AIConnector(mode=MODE_INTERNET).analyze({"documents": []})
+    assert res["status"] == "not_configured"
+    assert res["proposals"] == []
 
 
 def test_ai_connector_unknown_mode_falls_back_to_off():
@@ -347,8 +360,11 @@ def test_gui_ai_analysis_requires_selected_project(db, project, monkeypatch, gui
     assert window.ai_output.toPlainText() == ""
 
     window.projects_table.selectRow(0)
+    window.ai_request_input.setText("Проверь комплект АОСР №1")
     window.run_ai_check()
-    assert f"ID {project.id}" in window.ai_output.toPlainText()
+    output = window.ai_output.toPlainText()
+    assert project.title in output, "ИИ должен работать с выбранным проектом"
+    assert "черновик" in output.lower()
     window.close()
 
 

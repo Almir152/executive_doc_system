@@ -77,6 +77,9 @@ DOC_TYPE_LABELS = {
     DOC_TYPE_TEST_ACT: "Акт испытаний",
 }
 
+#: Итоговые акты — те, что завершают акты скрытых работ (ТЗ п.87).
+FINAL_ACT_TYPES = (DOC_TYPE_AOOK, DOC_TYPE_AOU_SITO)
+
 # --- Раздел 85. Состояния документа -------------------------------------
 DOC_STATUS_DRAFT = "draft"       # рабочий, до выпуска
 DOC_STATUS_ISSUED = "issued"     # выпущен, версия зафиксирована
@@ -241,6 +244,19 @@ HISTORY_REGISTER_WRITTEN = "register_written"
 HISTORY_PDF_SAVED = "pdf_saved"
 HISTORY_AI_PROPOSED = "ai_proposed"
 HISTORY_AI_ACTION_APPLIED = "ai_action_applied"
+
+# --- Предложения ИИ-агента (ТЗ п.104, 105) ---
+# Результат работы ИИ — черновик. Он не является выпущенным исполнительным
+# документом и не меняет данные, пока оператор не подтвердит применение.
+AI_PROPOSAL_DRAFT = "draft"
+AI_PROPOSAL_ACCEPTED = "accepted"
+AI_PROPOSAL_REJECTED = "rejected"
+AI_PROPOSAL_STATUSES = (AI_PROPOSAL_DRAFT, AI_PROPOSAL_ACCEPTED, AI_PROPOSAL_REJECTED)
+
+#: Изменения, которые ИИ может предложить. Применяются только через
+#: прикладной API после подтверждения оператора (ТЗ п.104).
+AI_ACTION_LINK_DOCUMENTS = "link_documents"
+AI_ACTIONS = (AI_ACTION_LINK_DOCUMENTS,)
 
 # --- Раздел 64. Поведение при незаполненном представителе эксплуатации ---
 EXPLOITATION_MISSING_KEEP = "keep"      # оставить пустое место
