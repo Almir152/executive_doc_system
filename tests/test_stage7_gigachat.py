@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
+import ssl
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -17,7 +20,9 @@ import pytest
 from app.ai import provider_result, secrets
 from app.ai.connector import AIConnector, MODE_INTERNET, build_internet_provider
 from app.ai.gigachat import (
-    DEFAULT_SCOPE, GigaChatConfig, GigaChatProvider, TOKEN_GUARD_SECONDS,
+    CA_BUNDLE_ENV, DEFAULT_SCOPE, GigaChatConfig, GigaChatError,
+    GigaChatProvider,
+    TOKEN_GUARD_SECONDS, ssl_context,
 )
 
 
@@ -432,3 +437,74 @@ def test_request_goes_through_proxy_from_environment(monkeypatch):
         proxy.server_close()
     # Прокси получает абсолютный адрес, а не относительный путь.
     assert seen == ["http://api.giga.invalid/api/v2/oauth"]
+
+
+# =====================================================================
+# Перехват TLS корпоративным прокси (ошибка CERTIFICATE_VERIFY_FAILED)
+# =====================================================================
+
+OPENSSL = shutil.which("openssl")
+
+
+@pytest.fixture
+def self_signed(tmp_path):
+    """Самоподписанный сертификат: сервис, которому нельзя доверять."""
+    if OPENSSL is None:
+        pytest.skip("openssl недоступен")
+    key = tmp_path / "key.pem"
+    cert = tmp_path / "cert.pem"
+    subprocess.run(
+        [OPENSSL, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", str(key), "-out", str(cert), "-days", "1",
+         "-subj", "/CN=localhost"],
+        check=True, capture_output=True,
+    )
+    return cert, key
+
+
+def test_untrusted_certificate_is_refused_with_explanation(self_signed, monkeypatch):
+    """Чужой сертификат не принимается, но оператор получает причину и подсказку."""
+    cert, key = self_signed
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=str(cert), keyfile=str(key))
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    monkeypatch.delenv("EXECUTIVE_DOC_CA_BUNDLE", raising=False)
+    monkeypatch.setattr(
+        GigaChatConfig, "__init__",
+        _config_with_url(f"https://{host}:{port}/v1",
+                         f"https://{host}:{port}/api/v2/oauth"),
+    )
+    try:
+        provider = GigaChatProvider(GigaChatConfig(), "ключ")
+        with pytest.raises(GigaChatError) as failure:
+            provider.access_token()
+    finally:
+        server.shutdown()
+        server.server_close()
+    message = str(failure.value)
+    assert "не прошёл проверку" in message
+    assert CA_BUNDLE_ENV in message
+    assert "отключать нельзя" in message
+
+
+def test_certificate_bundle_from_environment_is_trusted(self_signed, monkeypatch):
+    """Корпоративный корень из переменной окружения принимается."""
+    cert, _key = self_signed
+    monkeypatch.setenv(CA_BUNDLE_ENV, str(cert))
+    context = ssl_context()
+    subjects = [entry.get("subject") for entry in context.get_ca_certs()]
+    assert any("localhost" in str(value) for subject in subjects
+               for value in subject)
+    # Системные сертификаты при этом остаются доверенными.
+    assert len(context.get_ca_certs()) > 1
+
+
+def test_missing_certificate_bundle_is_reported(monkeypatch, tmp_path):
+    monkeypatch.setenv(CA_BUNDLE_ENV, str(tmp_path / "нет-файла.pem"))
+    with pytest.raises(GigaChatError) as failure:
+        ssl_context()
+    assert CA_BUNDLE_ENV in str(failure.value)

@@ -22,6 +22,7 @@ import base64
 import http.client
 import json
 import logging
+import os
 import ssl
 import time
 import urllib.parse
@@ -37,6 +38,9 @@ DEFAULT_TOKEN_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 #: Запас до истечения токена, чтобы не опрашивать истёкший (около 30 минут).
 TOKEN_GUARD_SECONDS = 60
 DEFAULT_TIMEOUT = 60
+#: Файл с корпоративным корнем сертификации: на сетях с перехватом TLS
+#: системных сертификатов недостаточно, корнем нужно доверять явно.
+CA_BUNDLE_ENV = "EXECUTIVE_DOC_CA_BUNDLE"
 
 #: Коды предложений: модель не выдумывает существующие коды (ТЗ п.106).
 CODE_GIGA_REVIEW = "gigachat_review"
@@ -79,6 +83,43 @@ class GigaChatConfig:
         )
 
 
+def ssl_context() -> ssl.SSLContext:
+    """Контекст TLS: системные сертификаты плюс корпоративный корень.
+
+    Проверку сертификата отключать нельзя: по этому соединению уходит ключ
+    авторизации. Если сертификат не проходит проверку, значит сертификат
+    выпущен не для GigaChat — доверять такому соединению нельзя.
+    """
+    context = ssl.create_default_context()
+    bundle = (os.environ.get(CA_BUNDLE_ENV) or "").strip()
+    if not bundle:
+        return context
+    if not os.path.isfile(bundle):
+        raise GigaChatError(
+            f"Файл сертификатов из {CA_BUNDLE_ENV} не найден: {bundle}"
+        )
+    try:
+        context.load_verify_locations(cafile=bundle)
+    except (OSError, ssl.SSLError) as exc:
+        raise GigaChatError(
+            f"Не удалось прочитать сертификаты из {CA_BUNDLE_ENV} ({bundle}): {exc}"
+        ) from exc
+    return context
+
+
+def _ssl_problem(exc: ssl.SSLCertVerificationError) -> str:
+    """Причина отказа проверки сертификата и что делать оператору."""
+    reason = getattr(exc, "verify_message", None) or str(exc)
+    return (
+        f"{reason}. Сертификат сервиса не прошёл проверку. "
+        "Если сеть перехватывает TLS (корпоративный прокси или антивирус), "
+        f"укажите корпоративный корень в файле .pem через переменную "
+        f"{CA_BUNDLE_ENV}, либо в стандартной переменной SSL_CERT_FILE. "
+        "Проверку сертификатов отключать нельзя: по этому соединению "
+        "передаётся ключ авторизации."
+    )
+
+
 def _connect(parts, timeout: int) -> tuple[http.client.HTTPConnection, str]:
     """Соединение с учётом прокси из переменных окружения.
 
@@ -97,7 +138,7 @@ def _connect(parts, timeout: int) -> tuple[http.client.HTTPConnection, str]:
     connection: http.client.HTTPConnection
     if secure:
         connection = http.client.HTTPSConnection(
-            host, port, timeout=timeout, context=ssl.create_default_context()
+            host, port, timeout=timeout, context=ssl_context()
         )
     else:
         connection = http.client.HTTPConnection(host, port, timeout=timeout)
@@ -124,6 +165,8 @@ def _send(url: str, body: bytes, headers: dict, timeout: int) -> tuple[int, str]
         connection.request("POST", path, body=body, headers=headers)
         response = connection.getresponse()
         return response.status, response.read().decode("utf-8", errors="replace")
+    except ssl.SSLCertVerificationError as exc:
+        raise GigaChatError(f"Не удалось обратиться к GigaChat: {_ssl_problem(exc)}") from exc
     except (OSError, http.client.HTTPException) as exc:
         raise GigaChatError(f"Не удалось обратиться к GigaChat: {exc}") from exc
     finally:
