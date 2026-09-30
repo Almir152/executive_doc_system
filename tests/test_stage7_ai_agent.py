@@ -20,6 +20,7 @@ from app.core.services import (
     storage_service,
 )
 from app.db.models import AiProposal, Document, DocumentLink, HistoryEvent, NormativeForm
+from app.config import ARCHIVE_DIR as ARCHIVE_PDF_DIR
 
 
 @pytest.fixture
@@ -395,3 +396,166 @@ def test_basis_format_is_readable():
     assert "приказ Минстроя №344/пр" in text
     assert "п. 4" in text
     assert normative.format_basis(None) == "основание не указано"
+
+
+# =====================================================================
+# П.103: ТЕКСТ ФАЙЛОВ — ТОЛЬКО ПО ВЫБОРУ ОПЕРАТОРА
+# =====================================================================
+
+
+def _archive_with_text(db, project, name="СХЕМА.pdf", body="Армирование стен КЖ-12"):
+    """Положить в архив файл с настоящим текстовым слоем PDF."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    from app.core.services import printing
+
+    printing.register_fonts()
+    source = ARCHIVE_PDF_DIR / name
+    source.parent.mkdir(parents=True, exist_ok=True)
+    pdf = canvas.Canvas(str(source), pagesize=A4)
+    pdf.setFont(printing.FONT_FAMILY, 11)
+    pdf.drawString(60, 780, body)
+    pdf.showPage()
+    pdf.save()
+    archive = storage_service.add_file_to_archive(
+        db, src_path=source, project_id=project.id,
+        category=domain.ARCHIVE_CATEGORY_SCHEMES,
+    )
+    return archive
+
+
+def test_file_text_is_not_passed_without_operator_choice(db, project, aosr):
+    """Без отметки оператора текст файла в контекст не попадает (ТЗ п.103)."""
+    _archive_with_text(db, project)
+    context = ai_context.build_context(db, project.id, "Проверь комплект")
+    assert context["file_texts"] == []
+    assert "Армирование стен" not in repr(context)
+
+
+def test_operator_choice_adds_text_without_paths(db, project, aosr):
+    """Отмеченный файл читает система; пути наружу не уходят (ТЗ п.103)."""
+    from app.config import ARCHIVE_DIR
+
+    archive = _archive_with_text(db, project)
+    context = ai_context.build_context(
+        db, project.id, "Проверь комплект", file_text_ids=[archive.id]
+    )
+    ai_context.assert_context_is_allowed(context)
+    row = context["file_texts"][0]
+    assert row["available"] is True
+    assert "Армирование стен" in row["text"]
+    assert "stored_path" not in repr(context)
+    assert str(ARCHIVE_DIR) not in repr(context)
+
+
+def test_unsupported_format_is_reported_not_guessed(db, project):
+    """Нечитаемый формат — честная причина, а не выдуманный текст (ТЗ п.106)."""
+    source = ARCHIVE_PDF_DIR / "Чертёж.dwg"
+    source.write_bytes(b"AC1027 dwg")
+    archive = storage_service.add_file_to_archive(
+        db, src_path=source, project_id=project.id,
+        category=domain.ARCHIVE_CATEGORY_SCHEMES,
+    )
+    context = ai_context.build_context(
+        db, project.id, "Проверь комплект", file_text_ids=[archive.id]
+    )
+    row = context["file_texts"][0]
+    assert row["available"] is False
+    assert "dwg" in row["reason"]
+
+
+def test_scanned_pdf_is_reported_as_without_text_layer(db, project):
+    """Скан без текстового слоя ИИ прямо называет как нечитаемый (ТЗ п.106)."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    source = ARCHIVE_PDF_DIR / "Скан.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    pdf = canvas.Canvas(str(source), pagesize=A4)
+    pdf.rect(60, 700, 200, 60, fill=True)
+    pdf.showPage()
+    pdf.save()
+    archive = storage_service.add_file_to_archive(
+        db, src_path=source, project_id=project.id,
+        category=domain.ARCHIVE_CATEGORY_SCHEMES,
+    )
+    context = ai_context.build_context(
+        db, project.id, "Проверь комплект", file_text_ids=[archive.id]
+    )
+    row = context["file_texts"][0]
+    assert row["available"] is False
+    assert "текстов" in row["reason"]
+
+
+def test_file_of_another_project_is_not_read(db, project, direction):
+    """Файл чужого проекта в контекст не попадает (ТЗ п.103)."""
+    from app.db.models import Project
+
+    other = Project(direction_id=direction.id, title="Другой объект")
+    db.add(other)
+    db.commit()
+    archive = _archive_with_text(db, other, "СХЕМА-другого.pdf", "Другая схема")
+
+    context = ai_context.build_context(
+        db, project.id, "Проверь комплект", file_text_ids=[archive.id]
+    )
+    row = context["file_texts"][0]
+    assert row["available"] is False
+    assert "не найден" in row["reason"]
+    assert "Другая схема" not in repr(context)
+
+
+def test_internet_mode_refuses_file_text(db, project):
+    """Текст файла не уходит наружу даже по отметке (ТЗ п.9, 103)."""
+    archive = _archive_with_text(db, project)
+    context = ai_context.build_context(
+        db, project.id, "Проверь комплект", file_text_ids=[archive.id]
+    )
+    answer = AIConnector(mode=MODE_INTERNET).analyze(context)
+    assert answer["status"] == "refused"
+    assert answer["proposals"] == []
+    assert "интернет" in answer["message"].lower()
+
+
+def test_local_rules_report_what_they_could_not_read(db, project):
+    """ИИ говорит, что не смог прочитать, а не молчит (ТЗ п.106)."""
+    archive = _archive_with_text(db, project)
+    context = ai_context.build_context(
+        db, project.id, "Проверь комплект", file_text_ids=[archive.id]
+    )
+    assert ai_context.CONTEXT_KEYS
+    from app.ai import rules
+
+    codes = [proposal["code"] for proposal in rules.analyze_context(context)]
+    assert rules.CODE_FILE_TEXT_UNAVAILABLE not in codes
+
+    context["file_texts"][0]["available"] = False
+    context["file_texts"][0]["reason"] = "нет текстового слоя"
+    codes = [proposal["code"] for proposal in rules.analyze_context(context)]
+    assert rules.CODE_FILE_TEXT_UNAVAILABLE in codes
+
+
+def test_history_records_which_file_texts_were_sent(db, project):
+    """В истории видно, чей текст увидел ИИ, без самого текста (ТЗ п.86, 103)."""
+    archive = _archive_with_text(db, project)
+    result = ai_service.analyze(
+        db, project.id, "Проверь комплект",
+        AIConnector(mode=MODE_LOCAL), file_text_ids=[archive.id],
+    )
+    event = next(
+        event for event in history_events(db, project.id)
+        if event.event_type == domain.HISTORY_AI_PROPOSED
+    )
+    payload = event.payload["file_texts"]
+    assert payload[0]["name"] == "СХЕМА.pdf"
+    assert payload[0]["chars"] > 0
+    assert "text" not in payload[0]
+    assert "Армирование стен" not in event.message
+    assert result["context"]["file_texts"][0]["available"] is True
+
+
+def history_events(db, project_id):
+    from app.core.services import project_service
+
+    return project_service.list_events(db, project_id)

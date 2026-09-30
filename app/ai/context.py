@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 #: Ключи, которые ИИ имеет право видеть. Всё остальное — недоступно (ТЗ п.103).
 CONTEXT_KEYS = (
     "project", "documents", "links", "archive", "materials", "normative",
-    "requested_documents", "request",
+    "requested_documents", "request", "file_texts",
 )
 
 #: Ключи карточки проекта.
@@ -41,12 +41,18 @@ TYPE_WORDS = {
 
 
 def build_context(
-    db: Session, project_id: int, request: str | None = None
+    db: Session, project_id: int, request: str | None = None,
+    file_text_ids: Iterable[int] | None = None,
 ) -> dict:
     """Собрать контекст проекта для ИИ-агента (ТЗ п.102, 103).
 
     В контекст попадают реквизиты документов, логические связи, сведения об
     архиве и материалах — без путей на диске и без содержимого файлов.
+
+    Текст файлов архива добавляется только по явному выбору оператора:
+    `file_text_ids` — идентификаторы отмеченных файлов, прочитанные самой
+    системой (ТЗ п.103). По умолчанию (`None`) в контексте остаётся пустой
+    список: молчаливая передача содержимого невозможна.
     """
     from app.db.models import (
         Document, DocumentArchiveLink, DocumentLink, Material, NormativeForm, Project,
@@ -86,11 +92,61 @@ def build_context(
         "normative": _normative_rows(db, NormativeForm),
         "requested_documents": [],
         "request": (request or "").strip(),
+        "file_texts": _file_text_rows(db, project_id, file_text_ids),
     }
     context["requested_documents"] = find_document_ids(
         context["request"], context["documents"]
     )
     return context
+
+
+def _file_text_rows(
+    db: Session, project_id: int, file_text_ids: Iterable[int] | None
+) -> list[dict]:
+    """Тексты файлов, которые оператор явно передал ИИ (ТЗ п.103).
+
+    Читает файлы система через хранилище архива; наружу уходит текст и
+    опознавательные реквизиты (имя, тип, версия), но не путь и не хеш.
+    """
+    from app.ai.file_text import extract_file_text
+    from app.db.models import ArchiveDocument
+    from app.core.services import storage_service
+
+    if not file_text_ids:
+        return []
+    rows: list[dict] = []
+    for archive_id in dict.fromkeys(file_text_ids):
+        archive = db.get(ArchiveDocument, archive_id)
+        if archive is None or archive.project_id != project_id:
+            rows.append({
+                "archive_id": archive_id, "name": "", "file_type": "",
+                "version_no": None, "available": False,
+                "reason": "файл не найден в архиве проекта",
+            })
+            continue
+        version = storage_service.actual_file_version(db, archive.id)
+        if version is None:
+            rows.append({
+                "archive_id": archive.id, "name": archive.original_name,
+                "file_type": archive.file_type, "version_no": None,
+                "available": False, "reason": "у файла нет версии в архиве",
+            })
+            continue
+        result = extract_file_text(
+            version.stored_path, archive.file_type
+        )
+        rows.append({
+            "archive_id": archive.id,
+            "name": archive.original_name,
+            "file_type": archive.file_type,
+            "version_no": version.version_no,
+            "available": result.available,
+            "reason": result.reason,
+            "pages": result.pages,
+            "truncated": result.truncated,
+            "text": result.text,
+        })
+    return rows
 
 
 def _document_row(db: Session, document) -> dict:
@@ -230,6 +286,16 @@ def describe_context(context: dict) -> str:
     requested = context.get("requested_documents") or []
     if requested:
         parts.append("Запрошены документы: " + ", ".join(str(i) for i in requested))
+    texts = [
+        row for row in (context.get("file_texts") or []) if row.get("available")
+    ]
+    if texts:
+        parts.append(
+            "Текст файлов: " + ", ".join(
+                f"{row.get('name', '')} ({len(row.get('text') or '')} симв.)"
+                for row in texts
+            )
+        )
     return "; ".join(parts)
 
 

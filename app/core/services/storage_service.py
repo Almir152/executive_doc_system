@@ -354,6 +354,26 @@ def quality_validity_text(document: ArchiveDocument) -> str:
     return f"действует {start} — {end}"
 
 
+def actual_file_version(
+    db: Session, archive_document_id: int
+) -> ArchiveFileVersion | None:
+    """Действующая версия файла архивного документа (ТЗ п.53, 103).
+
+    Системный интерфейс чтения архива: возвращает версию с файлом на диске,
+    чтобы прикладной слой (в том числе извлечение текста для ИИ) не искал
+    файлы в обход хранилища (ТЗ п.103).
+    """
+    document = get_archive_document(db, archive_document_id)
+    if document is None:
+        return None
+    return db.scalars(
+        select(ArchiveFileVersion).where(
+            ArchiveFileVersion.archive_document_id == document.id,
+            ArchiveFileVersion.is_actual.is_(True),
+        ).order_by(ArchiveFileVersion.version_no.desc())
+    ).first()
+
+
 def add_version(db: Session, archive_document_id: int, src_path: Path) -> ArchiveFileVersion:
     """Добавить новую версию существующего архивного документа (ТЗ п.53)."""
     document = get_archive_document(db, archive_document_id)

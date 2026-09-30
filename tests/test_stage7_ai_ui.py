@@ -4,7 +4,8 @@ import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QMessageBox
 
-from app.ai.connector import MODE_LOCAL, MODE_OFF
+from app.ai.connector import MODE_INTERNET, MODE_LOCAL, MODE_OFF
+from app.config import ARCHIVE_DIR
 from app.core import domain
 from app.core.services import document_service
 from app.db.models import DocumentLink
@@ -176,3 +177,105 @@ def test_normative_basis_is_shown_to_operator(ai_window, db, project):
     kind = ai_window.ai_table.item(row, 2).text()
     assert basis and basis != "основание не указано", "у требования должно быть основание"
     assert kind == "требование нормы"
+
+
+# =====================================================================
+# П.103: ФАЙЛЫ ПЕРЕДАЮТСЯ ТОЛЬКО ПО ОТМЕТКЕ ОПЕРАТОРА
+# =====================================================================
+
+
+def _archive_pdf(db, project, name="СХЕМА UI.pdf", body="Текст схемы для анализа"):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    from app.core.services import printing, storage_service
+
+    printing.register_fonts()
+    source = ARCHIVE_DIR / name
+    source.parent.mkdir(parents=True, exist_ok=True)
+    pdf = canvas.Canvas(str(source), pagesize=A4)
+    pdf.setFont(printing.FONT_FAMILY, 11)
+    pdf.drawString(60, 780, body)
+    pdf.showPage()
+    pdf.save()
+    return storage_service.add_file_to_archive(
+        db=db, src_path=source, project_id=project.id,
+        category=domain.ARCHIVE_CATEGORY_SCHEMES,
+    )
+
+
+@pytest.mark.gui
+def test_ai_file_list_is_unchecked_by_default(ai_window, db, project, ai_documents):
+    """Без отметки оператора текст файла ИИ не передаётся (ТЗ п.103)."""
+    _archive_pdf(db, project)
+    ai_window.run_ai_check()
+
+    assert ai_window.ai_files_list.count() == 1
+    assert ai_window.ai_files_list.item(0).checkState() == Qt.CheckState.Unchecked
+    assert "Ничего не отмечено" in ai_window.ai_files_hint.text()
+    assert "Текст файлов" not in ai_window.ai_output.toPlainText()
+
+
+@pytest.mark.gui
+def test_ai_file_text_needs_confirmation(
+    ai_window, db, project, ai_documents, monkeypatch
+):
+    """Текст отмеченного файла передаётся только после подтверждения."""
+    asked = []
+
+    def question(parent, title, text, *args, **kwargs):
+        asked.append(text)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(question))
+    _archive_pdf(db, project)
+    ai_window.run_ai_check()
+    item = ai_window.ai_files_list.item(0)
+    item.setCheckState(Qt.CheckState.Checked)
+
+    ai_window.run_ai_check()
+
+    assert asked, "оператор должен подтвердить передачу текста"
+    assert "СХЕМА UI.pdf" in asked[0]
+    assert "переданы" not in ai_window.ai_output.toPlainText().lower()
+
+
+@pytest.mark.gui
+def test_ai_file_text_is_sent_after_confirmation(
+    ai_window, db, project, ai_documents, monkeypatch
+):
+    """После подтверждения ИИ видит текст файла (ТЗ п.103)."""
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes),
+    )
+    _archive_pdf(db, project)
+    ai_window.run_ai_check()
+    ai_window.ai_files_list.item(0).setCheckState(Qt.CheckState.Checked)
+
+    ai_window.run_ai_check()
+
+    output = ai_window.ai_output.toPlainText()
+    assert "СХЕМА UI.pdf" in output
+    assert "Текст файлов" in output
+
+
+@pytest.mark.gui
+def test_ai_internet_mode_blocks_file_text(
+    ai_window, db, project, ai_documents, monkeypatch
+):
+    """В интернет-режиме текст файла не передаётся (ТЗ п.9, 103)."""
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda parent, title, text: warnings.append(text)),
+    )
+    _archive_pdf(db, project)
+    ai_window.ai.mode = MODE_INTERNET
+    ai_window.run_ai_check()
+    ai_window.ai_files_list.item(0).setCheckState(Qt.CheckState.Checked)
+
+    ai_window.run_ai_check()
+
+    assert warnings, "интернет-режим должен отказать"
+    assert "интернет" in warnings[0].lower()

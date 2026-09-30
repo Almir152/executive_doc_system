@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QListWidget,
+    QListWidgetItem,
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QTextEdit, QMessageBox, QInputDialog, QStackedWidget, QFileDialog,
     QLineEdit, QFormLayout, QComboBox, QGroupBox
@@ -16,7 +17,7 @@ from app.db.database import (
 )
 from app.db.models import Direction, Project
 from app.ai import normative
-from app.ai.connector import AIConnector, MODE_LABELS, MODE_ORDER
+from app.ai.connector import AIConnector, MODE_INTERNET, MODE_LABELS, MODE_ORDER
 from app.core.services import ai_service, backup_service, storage_service
 from app.core.services.storage_service import (
     ARCHIVE_CATEGORIES, ARCHIVE_CATEGORY_DEFAULT, StorageError, add_file_to_archive,
@@ -291,6 +292,27 @@ class MainWindow(QMainWindow):
         self.ai_output.setReadOnly(True)
         self.ai_output.setMaximumHeight(110)
         layout.addWidget(self.ai_output)
+
+        # ТЗ п.103: ИИ получает только то, что оператор отметил. Передача
+        # текста файла включается галочками, по умолчанию всё выключено.
+        self.ai_files_box = QGroupBox(
+            "Текст файлов архива для анализа (ТЗ п.103)"
+        )
+        files_layout = QVBoxLayout(self.ai_files_box)
+        self.ai_files_hint = QLabel(
+            "Ничего не отмечено — ИИ видит только реквизиты. Отмеченные "
+            "файлы читает система; пути и имена папок наружу не передаются. "
+            "В интернет-режиме передача текста невозможна."
+        )
+        self.ai_files_hint.setWordWrap(True)
+        files_layout.addWidget(self.ai_files_hint)
+        self.ai_files_list = QListWidget()
+        self.ai_files_list.setSelectionMode(
+            QListWidget.SelectionMode.NoSelection
+        )
+        self.ai_files_list.setMaximumHeight(110)
+        files_layout.addWidget(self.ai_files_list)
+        layout.addWidget(self.ai_files_box)
 
         self.ai_table = QTableWidget(0, 4)
         self.ai_table.setHorizontalHeaderLabels(
@@ -809,8 +831,13 @@ class MainWindow(QMainWindow):
         request = self.ai_request_input.text().strip()
         if not request:
             request = "Проверь комплект проекта"
+        file_text_ids = self.selected_ai_file_ids()
+        if file_text_ids and not self._confirm_ai_file_text(file_text_ids):
+            return
         try:
-            result = ai_service.analyze(self.db, project_id, request, self.ai)
+            result = ai_service.analyze(
+                self.db, project_id, request, self.ai, file_text_ids=file_text_ids
+            )
         except (ai_service.AiError, ValueError) as exc:
             QMessageBox.critical(self, "ИИ-агент", str(exc))
             return
@@ -831,6 +858,7 @@ class MainWindow(QMainWindow):
 
     def load_ai_proposals(self, project_id: int):
         """Показать предложения ИИ по проекту (ТЗ п.105)."""
+        self.load_ai_file_list(project_id)
         proposals = ai_service.list_proposals(self.db, project_id)
         self.ai_table.setRowCount(0)
         for proposal in proposals:
@@ -849,6 +877,85 @@ class MainWindow(QMainWindow):
                 ),
             )
             self.ai_table.setItem(row, 3, QTableWidgetItem(proposal.status))
+
+    def _confirm_ai_file_text(self, file_text_ids: list[int]) -> bool:
+        """Подтверждение передачи текста файлов ИИ (ТЗ п.103, 104).
+
+        Оператор видит, что именно будет прочитано, и может отказаться.
+        Режим проверяется здесь же: интернет-режим с текстом файлов
+        запрещён, поэтому предупреждение не должно молча удивлять.
+        """
+        names = []
+        for index in range(self.ai_files_list.count()):
+            item = self.ai_files_list.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) in file_text_ids:
+                names.append(item.text())
+        if self.ai.mode == MODE_INTERNET:
+            QMessageBox.warning(
+                self, "Передача текста файлов (ТЗ п.103)",
+                "В интернет-режиме текст файлов передавать нельзя.\n"
+                "Снимите отметки или переключитесь на локальный ИИ.",
+            )
+            return False
+        answer = QMessageBox.question(
+            self,
+            "Передача текста файлов ИИ (ТЗ п.103)",
+            "Будут прочитаны и переданы ИИ файлы:\n• "
+            + "\n• ".join(names)
+            + "\n\nПередача выполняется локально, пути и имена папок не "
+            "передаются. Продолжить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def load_ai_file_list(self, project_id: int | None) -> None:
+        """Показать файлы архива, текст которых можно передать ИИ (ТЗ п.103).
+
+        Список заполняется без галочек: передать содержимое файла можно только
+        сознательным выбором оператора (ТЗ п.103, 104).
+        """
+        self.ai_files_list.clear()
+        if project_id is None:
+            self.ai_files_hint.setText(
+                "Выберите проект: файлы его архива появятся здесь (ТЗ п.103)."
+            )
+            return
+        from app.db.models import ArchiveDocument
+        from app.core.services import storage_service
+
+        documents = (
+            self.db.query(ArchiveDocument)
+            .filter(ArchiveDocument.project_id == project_id)
+            .order_by(ArchiveDocument.category, ArchiveDocument.original_name)
+            .all()
+        )
+        for archive in documents:
+            version = storage_service.actual_file_version(self.db, archive.id)
+            label = f"{archive.category}: {archive.original_name}"
+            if version is not None:
+                label += f" (версия {version.version_no})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, archive.id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.ai_files_list.addItem(item)
+        self.ai_files_hint.setText(
+            "Ничего не отмечено — ИИ видит только реквизиты. Отмеченные "
+            "файлы читает система; пути и имена папок наружу не передаются. "
+            "В интернет-режиме передача текста невозможна."
+        )
+
+    def selected_ai_file_ids(self) -> list[int]:
+        """Идентификаторы файлов, текст которых оператор передал ИИ (ТЗ п.103)."""
+        ids = []
+        for index in range(self.ai_files_list.count()):
+            item = self.ai_files_list.item(index)
+            if item.checkState() == Qt.CheckState.Checked:
+                archive_id = item.data(Qt.ItemDataRole.UserRole)
+                if archive_id is not None:
+                    ids.append(archive_id)
+        return ids
 
     def _selected_ai_proposal_id(self) -> int | None:
         """ID выбранного предложения ИИ или None (ТЗ п.104)."""

@@ -28,15 +28,22 @@ def analyze(
     project_id: int,
     request: str,
     connector,
+    file_text_ids: list[int] | None = None,
 ) -> dict:
     """Спросить ИИ по проекту и сохранить предложения-черновики (ТЗ п.102, 105).
 
     Возвращает ответ коннектора; найденные предложения уже записаны как
     черновики, но ничего не изменено.
+
+    `file_text_ids` — архивные файлы, текст которых оператор явно передал
+    ИИ (ТЗ п.103). По умолчанию None: текст файлов не передаётся никогда
+    молча, а выбор виден в журнале истории.
     """
     from app.ai import context as ai_context
 
-    context = ai_context.build_context(db, project_id, request)
+    context = ai_context.build_context(
+        db, project_id, request, file_text_ids=file_text_ids
+    )
     ai_context.assert_context_is_allowed(context)
     answer = connector.analyze(context)
     proposals = [
@@ -44,11 +51,18 @@ def analyze(
         if proposal.get("text")
     ]
     stored = [_store(db, project_id, proposal) for proposal in proposals]
-    if stored:
+    file_texts = _file_text_summary(context)
+    if stored or file_texts:
         record_event(
             db, project_id, domain.HISTORY_AI_PROPOSED,
             f"ИИ ({answer.get('mode', '')}) предложил изменений: {len(stored)} "
-            f"черновиков по запросу «{request.strip()}» (ТЗ п.102, 105)",
+            f"черновиков по запросу «{request.strip()}» (ТЗ п.102, 105)"
+            + (
+                f"; текст файлов передан по выбору оператора: "
+                f"{', '.join(row['name'] or 'файл' for row in file_texts)} "
+                f"(ТЗ п.103)"
+                if file_texts else ""
+            ),
             entity_type="ai_proposal_batch",
             payload={
                 "request": request.strip(),
@@ -56,6 +70,7 @@ def analyze(
                 "mode": answer.get("mode"),
                 "proposal_ids": [proposal.id for proposal in stored],
                 "context": ai_context.describe_context(context),
+                "file_texts": file_texts,
             },
         )
         db.commit()
@@ -64,6 +79,28 @@ def analyze(
         "context": context,
         "proposals": stored,
     }
+
+
+def _file_text_summary(context: dict) -> list[dict]:
+    """Что именно по тексту файлов увидел ИИ — без самого текста (ТЗ п.86, 103).
+
+    В историю попадают имя файла, объём и причина отказа, но не содержимое:
+    журнал проекта читают другие сотрудники.
+    """
+    summary = []
+    for row in context.get("file_texts") or []:
+        summary.append({
+            "archive_id": row.get("archive_id"),
+            "name": row.get("name", ""),
+            "file_type": row.get("file_type", ""),
+            "version_no": row.get("version_no"),
+            "available": bool(row.get("available")),
+            "chars": len(row.get("text") or ""),
+            "pages": row.get("pages"),
+            "truncated": bool(row.get("truncated")),
+            "reason": row.get("reason", ""),
+        })
+    return summary
 
 
 def _store(db: Session, project_id: int, proposal: dict):

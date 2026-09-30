@@ -22,6 +22,8 @@ CODE_FINAL_ACT_WITHOUT_LINKS = "final_act_without_links"
 CODE_MATERIAL_WITHOUT_ACT = "material_without_test_act"
 CODE_NO_NORMS = "no_normative_basis"
 CODE_ACT_WITHOUT_MATERIALS = "test_act_without_materials"
+CODE_FILE_TEXT_UNAVAILABLE = "file_text_unavailable"
+CODE_FILE_TEXT_TRUNCATED = "file_text_truncated"
 
 
 def analyze_context(context: dict) -> list[dict]:
@@ -38,6 +40,33 @@ def analyze_context(context: dict) -> list[dict]:
     proposals.extend(_test_act_evidence(context, documents))
     proposals.extend(_materials(context))
     proposals.extend(_normative_caveat(context, documents))
+    proposals.extend(_file_text_limits(context))
+    return proposals
+
+
+def _file_text_limits(context: dict) -> list[dict]:
+    """Честно сказать, что именно из текста файлов увидел ИИ (ТЗ п.103, 106).
+
+    Проверки по содержимому файла строятся на нормативных основаниях, а не на
+    догадках. Если текст получить не удалось или он обрезан, ИИ обязан сказать
+    об этом прямо: иначе оператор решит, что файл проверен, а это не так.
+    """
+    proposals: list[dict] = []
+    for row in context.get("file_texts") or []:
+        name = row.get("name") or "файл архива"
+        if not row.get("available"):
+            reason = row.get("reason") or "причина не определена"
+            proposals.append(_remark(
+                CODE_FILE_TEXT_UNAVAILABLE,
+                f"Текст файла «{name}» не передан ИИ: {reason}. Содержимое "
+                "не проверялось.",
+            ))
+        elif row.get("truncated"):
+            proposals.append(_remark(
+                CODE_FILE_TEXT_TRUNCATED,
+                f"Текст файла «{name}» передан частично: проверялось начало, "
+                "остальная часть не анализировалась.",
+            ))
     return proposals
 
 

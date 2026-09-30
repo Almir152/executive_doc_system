@@ -35,6 +35,15 @@ MODE_ORDER = (MODE_LOCAL, MODE_INTERNET, MODE_OFF)
 STATUS_DISABLED = "disabled"
 STATUS_SUCCESS = "success"
 STATUS_NOT_CONFIGURED = "not_configured"
+#: Отказ по границе доступа: данные нельзя передавать в этом режиме.
+STATUS_REFUSED = "refused"
+
+
+def _has_file_text(context: dict) -> bool:
+    """Есть ли в контексте текст файлов, отмеченный оператором (ТЗ п.103)."""
+    return any(
+        row.get("available") for row in (context.get("file_texts") or [])
+    )
 
 
 class AIConnector:
@@ -80,6 +89,20 @@ class AIConnector:
             return {
                 "status": STATUS_DISABLED,
                 "message": "ИИ выключен: включите его в настройках (ТЗ п.9).",
+                "mode": self.mode,
+                "proposals": [],
+            }
+        if self.mode == MODE_INTERNET and _has_file_text(context):
+            # Текст документов наружу не уходит: для этого нужно отдельное
+            # решение оператора, а не молчаливая отправка вместе с запросом.
+            return {
+                "status": STATUS_REFUSED,
+                "message": (
+                    "Отмечены файлы, текст которых нельзя передавать в "
+                    "интернет-режиме. Снимите отметки или переключитесь на "
+                    "локальный ИИ: текст файла остаётся на компьютере "
+                    "(ТЗ п.9, 103)."
+                ),
                 "mode": self.mode,
                 "proposals": [],
             }
