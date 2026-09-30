@@ -16,11 +16,12 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core import domain
-from app.core.services import document_service, link_service
+from app.core.services import document_service, form_service, link_service
 from app.core.services import project_service as service
 from app.db.models import (
     ArchiveDocument, Document, Organization, Package, SectionKind,
 )
+from app.ui.document_form import DocumentFormPanel
 
 _DATA_ROLE = Qt.ItemDataRole.UserRole
 _CHECKABLE = Qt.ItemFlag.ItemIsUserCheckable
@@ -217,6 +218,7 @@ class ProjectWindow(QWidget):
         super().__init__(parent)
         self.db = db
         self.project_id = project_id
+        self.form_panel = None
         self.build()
         self.reload()
 
@@ -276,6 +278,13 @@ class ProjectWindow(QWidget):
         self.btn_edit_document = QPushButton("Изменить реквизиты")
         self.btn_edit_document.clicked.connect(self.edit_document)
         doc_buttons.addWidget(self.btn_edit_document)
+        self.btn_open_form = QPushButton("Открыть форму (п.65)")
+        self.btn_open_form.clicked.connect(self.open_form)
+        doc_buttons.addWidget(self.btn_open_form)
+        self.btn_close_form = QPushButton("Закрыть форму")
+        self.btn_close_form.clicked.connect(self.close_form)
+        self.btn_close_form.setEnabled(False)
+        doc_buttons.addWidget(self.btn_close_form)
         doc_buttons.addStretch()
         documents_layout.addLayout(doc_buttons)
 
@@ -300,6 +309,13 @@ class ProjectWindow(QWidget):
         self.documents_hint.setWordWrap(True)
         documents_layout.addWidget(self.documents_hint)
         layout.addWidget(documents_box)
+
+        # Рабочая область формы документа (ТЗ п.65).
+        self.form_container = QWidget()
+        self.form_layout = QVBoxLayout(self.form_container)
+        self.form_layout.setContentsMargins(0, 0, 0, 0)
+        self.form_container.setVisible(False)
+        layout.addWidget(self.form_container)
 
         self.materials_box = QGroupBox(
             "Материалы (ТЗ п.44) и связи документов (ТЗ п.45, 47, 48)"
@@ -855,6 +871,59 @@ class ProjectWindow(QWidget):
     def _on_tree_selection(self) -> None:
         """Выбор документа в дереве перерисовывает его связи."""
         self._reload_links()
+
+    # -----------------------------------------------------------------
+    # ФОРМА ДОКУМЕНТА (ТЗ п.63, 64, 65, 66)
+    # -----------------------------------------------------------------
+    def open_form(self) -> None:
+        """Открыть форму выбранного документа в рабочей области (ТЗ п.65)."""
+        document = self._selected_document()
+        if document is None:
+            return
+        if self.form_panel is not None and self.form_panel.document_id != document.id:
+            if not self._close_form_confirmed():
+                return
+
+        if self.form_panel is not None:
+            self.form_panel.deleteLater()
+        self.form_panel = DocumentFormPanel(self.db, document.id)
+        self.form_layout.addWidget(self.form_panel)
+        self.form_container.setVisible(True)
+        self.btn_close_form.setEnabled(True)
+
+    def close_form(self) -> None:
+        """Закрыть форму; незавершённый ввод предлагается сохранить (ТЗ п.66)."""
+        if not self._close_form_confirmed():
+            return
+        if self.form_panel is not None:
+            self.form_panel.deleteLater()
+            self.form_panel = None
+        self.form_container.setVisible(False)
+        self.btn_close_form.setEnabled(False)
+
+    def _close_form_confirmed(self) -> bool:
+        """Спросить о несохранённом вводе; False означает отказ закрывать."""
+        if self.form_panel is None:
+            return True
+        panel = self.form_panel
+        if not form_service.has_unsaved_work(self.db, panel.document_id, panel.payload()):
+            return True
+
+        answer = QMessageBox.question(
+            self,
+            "Незавершённая форма (ТЗ п.66)",
+            "Форма заполнена не полностью. Сохранить черновик перед закрытием?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        if answer == QMessageBox.StandardButton.Save:
+            if not panel.save():
+                return False
+        return True
 
     def delete_section(self) -> None:
         row = self.sections_table.currentRow()
