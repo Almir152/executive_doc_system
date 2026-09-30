@@ -94,7 +94,7 @@ def next_backup_folder(root: Path | str = BACKUP_DIR) -> str:
 
 
 def create_backup(
-    db: Session,
+    db: Session | None = None,
     *,
     base_dir: Path | str = BACKUP_DIR,
     db_path: Path | str = DB_PATH,
@@ -106,8 +106,12 @@ def create_backup(
 
     Копия снимается через механизм бэкапа SQLite: простое копирование файла
     при открытой базе может поймать полузаписанную транзакцию (ТЗ п.98).
+
+    ``db`` не обязателен: копия снимается по снимку базы, поэтому её можно
+    сделать и до подключения ORM — так делает ``create_update_backup``.
     """
-    _ensure_session_saved(db)
+    if db is not None:
+        _ensure_session_saved(db)
     db_path = Path(db_path)
     ensure_dirs()
     if not db_path.is_file():
@@ -154,6 +158,32 @@ def _ensure_session_saved(db: Session) -> None:
             "Есть несохранённые изменения — сначала завершите работу с "
             "документами, затем сделайте резервную копию (ТЗ п.86, 98)."
         )
+
+
+def create_update_backup(
+    *,
+    base_dir: Path | str = BACKUP_DIR,
+    db_path: Path | str = DB_PATH,
+    archive_dir: Path | str = ARCHIVE_DIR,
+    settings_path: Path | str = SETTINGS_PATH,
+) -> Path:
+    """Копия перед обновлением программы (ТЗ п.97, 98).
+
+    Схема базы меняется только через миграцию (ТЗ п.97), а миграция может
+    пересобрать таблицы. Поэтому до неё снимается копия, которую оператор
+    сможет вернуть, если обновление пойдёт не так.
+
+    Копия делается по файлу базы, без ORM: на момент обновления схема может
+    ещё соответствовать прежней версии программы.
+    """
+    return create_backup(
+        None,
+        base_dir=base_dir,
+        db_path=db_path,
+        archive_dir=archive_dir,
+        settings_path=settings_path,
+        note="Перед обновлением программы",
+    )
 
 
 def _snapshot_database(source: Path, target: Path) -> None:

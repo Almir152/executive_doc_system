@@ -154,6 +154,7 @@ def init_db() -> dict:
     from app.db import migrations
     from app.db.seed import seed_reference_data
 
+    pending_before = migrations.pending_for_engine(engine)
     applied = migrations.apply_migrations(engine)
     Base.metadata.create_all(bind=engine)
     # Сверка идёт после создания таблиц: на пустой базе до create_all
@@ -172,10 +173,20 @@ def init_db() -> dict:
         seeded = seed_reference_data(session)
     return {
         "migrations": applied,
+        # Что было не применено до запуска: оператор должен знать, что база
+        # обновлялась (ТЗ п.97).
+        "pending_before": pending_before,
         "seeded": seeded,
         "journal_ok": journal_ok,
         "journal_mode": journal_mode(),
     }
+
+
+def pending_update_migrations() -> list[str]:
+    """Миграции, которые применятся при следующем запуске (ТЗ п.97)."""
+    from app.db import migrations
+
+    return migrations.pending_for_engine(engine)
 
 
 def release_database() -> None:

@@ -11,7 +11,9 @@ from PyQt6.QtGui import QCloseEvent
 
 from app.config import ARCHIVE_DIR, BACKUP_DIR, DATA_DIR, PACKAGES_DIR, ensure_dirs
 from app.core import domain
-from app.db.database import SessionLocal, init_db, release_database
+from app.db.database import (
+    SessionLocal, init_db, pending_update_migrations, release_database,
+)
 from app.db.models import Direction, Project, Document
 from app.ai.connector import AIConnector, MODE_LABELS, MODE_ORDER
 from app.core.services import backup_service, storage_service
@@ -56,8 +58,9 @@ class MainWindow(QMainWindow):
         self.export_dir = str(PACKAGES_DIR)
         self.backup_dir = str(BACKUP_DIR)
 
-        # База данных и ИИ
-        init_db()
+        # База данных и ИИ. Перед применением миграций снимается копия:
+        # обновление не должно уничтожить проекты и документы (ТЗ п.97, 98).
+        self.update_report = self.prepare_database()
         self.db = SessionLocal()
         self.ai = AIConnector(mode="LOCAL")
 
@@ -774,6 +777,42 @@ class MainWindow(QMainWindow):
     # -----------------------------------------------------------------
     # РЕЗЕРВНОЕ КОПИРОВАНИЕ (ТЗ п.74, 98)
     # -----------------------------------------------------------------
+
+    def prepare_database(self) -> dict:
+        """Копия перед обновлением, затем миграции и отчёт оператору (ТЗ п.97).
+
+        Пока база не доведена до актуальной схемы, изменять её структуру
+        нельзя, а миграция пересобирает таблицы. Поэтому сначала снимается
+        копия (ТЗ п.98), и только потом применяются миграции.
+        """
+        pending = pending_update_migrations()
+        safety = None
+        if pending:
+            try:
+                safety = backup_service.create_update_backup()
+            except backup_service.BackupError as exc:
+                QMessageBox.critical(
+                    self,
+                    "Обновление программы",
+                    f"Не удалось сделать резервную копию перед обновлением:\n{exc}\n\n"
+                    "Обновление не выполнено: без копии миграция может привести "
+                    "к потере данных (ТЗ п.97, 98).",
+                )
+                raise
+        report = init_db()
+        report["update_backup"] = safety
+        if pending:
+            applied = ", ".join(report.get("migrations") or []) or "нет"
+            text = (
+                "Программа обновлена, схема базы приведена к актуальной версии.\n"
+                f"Применено миграций: {applied}\n"
+                "Проекты, документы, архив, связи, версии, комплекты и реестры "
+                "сохранены."
+            )
+            if safety is not None:
+                text += f"\n\nКопия до обновления: {safety}"
+            QMessageBox.information(self, "Обновление программы", text)
+        return report
 
     def load_backups(self):
         """Показать имеющиеся копии: свежие сверху (ТЗ п.74)."""

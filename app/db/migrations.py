@@ -696,6 +696,23 @@ def pending_migrations(from_version: int, to_version: int = SCHEMA_VERSION) -> l
     return [m for m in MIGRATIONS if from_version < m[0] <= to_version]
 
 
+def pending_migration_names(from_version: int, to_version: int = SCHEMA_VERSION) -> list[str]:
+    """Человекочитаемые имена миграций, которые ещё не применены."""
+    return [
+        f"{version:03d} {name}"
+        for version, name, _ in pending_migrations(from_version, to_version)
+    ]
+
+
+def pending_for_engine(engine, target: int = SCHEMA_VERSION) -> list[str]:
+    """Неприменённые миграции для базы, открытой движком."""
+    raw = engine.raw_connection()
+    try:
+        return pending_migration_names(get_user_version(raw), target)
+    finally:
+        raw.close()
+
+
 def apply_migrations(engine, target: int = SCHEMA_VERSION) -> list[str]:
     """Применить недостающие миграции, вернуть список имён.
 
