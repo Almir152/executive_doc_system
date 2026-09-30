@@ -362,7 +362,7 @@ def test_project_window_shows_links_of_selected_document(
 
     window = ProjectWindow(db, project.id)
     window.show()
-    window.documents_table.selectRow(0)
+    window._select_document(aosr.id)
     window._reload_links()
 
     assert window.links_table.rowCount() == 1

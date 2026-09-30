@@ -378,3 +378,12 @@ def list_events(db: Session, project_id: int, limit: int = 200) -> list[HistoryE
             .limit(limit)
         ).all()
     )
+
+
+def history_count(db: Session, project_id: int) -> int:
+    """Всего событий истории проекта (без ограничения показа)."""
+    return db.scalar(
+        select(func.count())
+        .select_from(HistoryEvent)
+        .where(HistoryEvent.project_id == project_id)
+    ) or 0

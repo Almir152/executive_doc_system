@@ -211,15 +211,97 @@ def test_project_window_creates_document_with_proposed_number(
 
     window = ProjectWindow(db, project.id)
     window.show()
+    _select_section(window, "АОСР")
     window.add_document()
 
     documents = db.query(Document).all()
     assert len(documents) == 1
     assert documents[0].doc_type == domain.DOC_TYPE_AOSR
     assert documents[0].number == "1"
-    assert window.documents_table.rowCount() == 1
-    assert window.documents_table.item(0, 1).text() == "1"
-    assert window.documents_table.item(0, 2).text() == "—", "дата не подставлена сама"
+    child = _tree_child(window, domain.DOC_TYPE_AOSR)
+    assert child.text(1) == "1"
+    assert child.text(2) == "—", "дата не подставлена сама"
+    assert window._selected_document_quiet().id == documents[0].id, (
+        "созданный документ должен оказаться выбранным: иначе оператор "
+        "не увидит его связи сразу после создания"
+    )
+    window.close()
+
+
+def _select_section(window, label: str) -> None:
+    """Выбрать строку вида в дереве документов."""
+    tree = window.document_tree
+    for index in range(tree.topLevelItemCount()):
+        item = tree.topLevelItem(index)
+        if item.text(0) == label:
+            tree.setCurrentItem(item)
+            return
+    raise AssertionError(f"в дереве нет раздела «{label}»")
+
+
+def _tree_child(window, doc_type):
+    """Первый документ указанного вида в дереве (ТЗ п.16)."""
+    label = domain.DOC_TYPE_LABELS[doc_type]
+    root = window.document_tree.invisibleRootItem()
+    for index in range(root.childCount()):
+        top = root.child(index)
+        if top.text(0) != label:
+            continue
+        assert top.childCount() > 0, f"в разделе «{label}» нет документов"
+        return top.child(0)
+    raise AssertionError(f"в дереве нет раздела «{label}»")
+
+
+def test_project_window_shows_empty_sections_for_all_types(db, project, qapp):
+    """ТЗ п.16: пустые разделы видов создаются сразу."""
+    from PyQt6.QtWidgets import QTreeWidget
+
+    from app.ui.project_window import ProjectWindow
+
+    window = ProjectWindow(db, project.id)
+    window.show()
+
+    tree = window.document_tree
+    assert isinstance(tree, QTreeWidget)
+    labels = [
+        tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())
+    ]
+    assert labels == [
+        "АОСР", "АООК", "АОУСИТО", "Акт испытаний",
+        "Связанные документы", "Комплекты", "История",
+    ], "структура дерева должна соответствовать ТЗ п.16"
+    for index in range(4):
+        assert tree.topLevelItem(index).childCount() == 0, "вид должен быть пустым"
+    for index in range(4, 7):
+        assert tree.topLevelItem(index).childCount() == 0, "часть должна быть пустой"
+    window.close()
+
+
+def test_project_window_groups_documents_by_type(db, project, qapp):
+    """Документы раскладываются по своим видам, а не одной строкой."""
+    from app.core.services import document_service
+    from app.ui.project_window import ProjectWindow
+
+    window = ProjectWindow(db, project.id)
+    window.show()
+    document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOU_SITO
+    )
+    document_service.create_document(
+        db, project.id, doc_type=domain.DOC_TYPE_AOSR, number="3"
+    )
+    window.reload()
+
+    tree = window.document_tree
+    counts = {
+        tree.topLevelItem(i).text(0): tree.topLevelItem(i).childCount()
+        for i in range(tree.topLevelItemCount())
+    }
+    assert counts == {
+        "АОСР": 1, "АООК": 0, "АОУСИТО": 1, "Акт испытаний": 0,
+        "Связанные документы": 0, "Комплекты": 0, "История": 0,
+    }
+    assert _tree_child(window, domain.DOC_TYPE_AOSR).text(1) == "3"
     window.close()
 
 
@@ -317,7 +399,7 @@ def test_project_window_saves_operator_date(db, project, qapp, monkeypatch):
     window.add_document()
 
     assert db.query(Document).one().doc_date == entered
-    assert window.documents_table.item(0, 2).text() == "07.11.2023"
+    assert _tree_child(window, domain.DOC_TYPE_AOSR).text(2) == "07.11.2023"
     window.close()
 
 
@@ -335,3 +417,42 @@ def test_parse_ru_date_rejects_garbage():
 
     with pytest.raises(ValueError, match="не распознана"):
         parse_ru_date("вчера")
+
+
+def test_project_window_tree_counts_match_data(db, project, qapp):
+    """Числа в дереве соответствуют данным, а не показывают нули (ТЗ п.16)."""
+    from app.ui.project_window import ProjectWindow
+
+    from app.core.services import project_service
+
+    service.create_document(db, project.id, doc_type=domain.DOC_TYPE_AOSR)
+    project_service.record_event(db, project.id, "project_created", "Проект создан")
+    project_service.record_event(db, project.id, "project_created", "Проект создан")
+    db.commit()
+
+    window = ProjectWindow(db, project.id)
+    window.show()
+    tree = window.document_tree
+    values = {
+        tree.topLevelItem(i).text(0): tree.topLevelItem(i).text(1)
+        for i in range(tree.topLevelItemCount())
+    }
+    assert values["История"] == "2"
+    assert values["Комплекты"] == "0"
+    assert values["Связанные документы"] == "0"
+    window.close()
+
+
+def test_project_window_tree_survives_reload(db, project, qapp):
+    """Повторная перерисовка не ломает дерево: узлы создаются заново."""
+    from app.ui.project_window import ProjectWindow
+
+    window = ProjectWindow(db, project.id)
+    window.show()
+    for _ in range(3):
+        window.reload()
+
+    tree = window.document_tree
+    assert tree.topLevelItemCount() == 7
+    assert tree.topLevelItem(0).text(0) == "АОСР"
+    window.close()

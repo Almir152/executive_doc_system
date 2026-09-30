@@ -11,18 +11,28 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from app.core import domain
 from app.core.services import document_service, link_service
 from app.core.services import project_service as service
 from app.db.models import (
-    ArchiveDocument, Organization, Package, SectionKind,
+    ArchiveDocument, Document, Organization, Package, SectionKind,
 )
 
 _DATA_ROLE = Qt.ItemDataRole.UserRole
 _CHECKABLE = Qt.ItemFlag.ItemIsUserCheckable
+# Идентификатор документа в дереве: None у строки вида (ТЗ п.16).
+_DOCUMENT_ID_ROLE = Qt.ItemDataRole.UserRole + 1
+# Пометка строки дерева: None у вида документа, «type» у вида, иначе часть проекта.
+_TREE_GROUP_ROLE = Qt.ItemDataRole.UserRole + 2
+
+# Части дерева проекта по ТЗ п.16.
+_RELATED_LABEL = "Связанные документы"
+_PACKAGES_LABEL = "Комплекты"
+_HISTORY_LABEL = "История"
 
 
 class DocumentDialog(QDialog):
@@ -255,8 +265,9 @@ class ProjectWindow(QWidget):
         sections_layout.addWidget(self.sections_table)
         layout.addWidget(self.sections_box)
 
-        # ТЗ п.16: разделы документов создаются пустыми, если их ещё нет.
-        documents_box = QGroupBox("Документы (ТЗ п.16, 42, 43)")
+        # ТЗ п.16: виды документов показаны дерево; пустой вид создаётся сразу,
+        # чтобы оператор мог начать работу до появления первого документа.
+        documents_box = QGroupBox("Документы проекта (ТЗ п.16, 42, 43)")
         documents_layout = QVBoxLayout(documents_box)
         doc_buttons = QHBoxLayout()
         self.btn_add_document = QPushButton("+ Документ")
@@ -267,16 +278,24 @@ class ProjectWindow(QWidget):
         doc_buttons.addWidget(self.btn_edit_document)
         doc_buttons.addStretch()
         documents_layout.addLayout(doc_buttons)
-        self.documents_table = QTableWidget(0, 5)
-        self.documents_table.setHorizontalHeaderLabels(
-            ["Тип", "Номер", "Дата", "Статус", "Выпуски"]
+
+        self.document_tree = QTreeWidget()
+        self.document_tree.setHeaderLabels(
+            ["Раздел / документ", "Номер", "Дата", "Статус", "Выпуски"]
         )
-        self.documents_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
+        self.document_tree.setSelectionBehavior(
+            QTreeWidget.SelectionBehavior.SelectRows
         )
-        documents_layout.addWidget(self.documents_table)
+        self.document_tree.itemSelectionChanged.connect(self._on_tree_selection)
+
+        # ТЗ п.16: Связанные документы, Комплекты и История — части дерева
+        # проекта, а не отдельные экраны. Показываются как узлы с числом
+        # записей; сами перечни остаются ниже. Узлы создаются при каждой
+        # перерисовке: очистка дерева уничтожает прежние элементы.
+        documents_layout.addWidget(self.document_tree)
         self.documents_hint = QLabel(
-            "Документов пока нет. Создайте первый документ проекта."
+            "Пустые разделы созданы по ТЗ п.16. Создайте первый документ "
+            "через «+ Документ»."
         )
         self.documents_hint.setWordWrap(True)
         documents_layout.addWidget(self.documents_hint)
@@ -405,21 +424,70 @@ class ProjectWindow(QWidget):
             for column, value in enumerate(values):
                 self.sections_table.setItem(row, column, QTableWidgetItem(value))
 
+    def _add_tree_group(self, label: str, marker: str, count: int | None = None):
+        """Узел дерева для части проекта, не являющейся видом документа."""
+        item = QTreeWidgetItem([label, "" if count is None else str(count), "", "", ""])
+        item.setData(0, _DOCUMENT_ID_ROLE, None)
+        item.setData(0, _TREE_GROUP_ROLE, marker)
+        self.document_tree.addTopLevelItem(item)
+        item.setExpanded(True)
+        return item
+
     def _load_documents(self, project) -> None:
+        """Дерево документов по видам (ТЗ п.16).
+
+        Пустой вид создаётся сразу: оператор должен иметь рабочий раздел
+        ещё до того, как появился первый документ.
+        """
         documents = document_service.list_documents(self.db, project.id)
-        self.documents_table.setRowCount(len(documents))
+        self.document_tree.clear()
+        by_type: dict[str, list] = {t: [] for t in domain.NUMBERED_DOC_TYPES}
+        for document in documents:
+            by_type.setdefault(document.doc_type, []).append(document)
+
+        for doc_type in domain.NUMBERED_DOC_TYPES:
+            label = domain.DOC_TYPE_LABELS.get(doc_type, doc_type)
+            group = self._add_tree_group(label, "type")
+            for document in by_type.get(doc_type, []):
+                issued = sum(1 for v in document.versions if v.issued_at is not None)
+                item = QTreeWidgetItem([
+                    f"{label} № {document.number}",
+                    document.number or "",
+                    document.doc_date.strftime("%d.%m.%Y")
+                    if document.doc_date else "—",
+                    _status_label(document.status),
+                    str(issued),
+                ])
+                item.setData(0, _DOCUMENT_ID_ROLE, document.id)
+                group.addChild(item)
+            group.setExpanded(True)
+
+        # Части проекта из ТЗ п.16: связаны, комплекты, история.
+        self._add_tree_group(
+            _RELATED_LABEL, "related",
+            self._archive_documents_count(project.id),
+        )
+        self._add_tree_group(
+            _PACKAGES_LABEL, "packages", self._packages_count(project.id)
+        )
+        self._add_tree_group(
+            _HISTORY_LABEL, "history",
+            service.history_count(self.db, project.id),
+        )
+
         self.documents_hint.setVisible(not documents)
-        for row, document in enumerate(documents):
-            issued = sum(1 for v in document.versions if v.issued_at is not None)
-            values = [
-                domain.DOC_TYPE_LABELS.get(document.doc_type, document.doc_type),
-                document.number or "",
-                document.doc_date.strftime("%d.%m.%Y") if document.doc_date else "—",
-                _status_label(document.status),
-                str(issued),
-            ]
-            for column, value in enumerate(values):
-                self.documents_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _archive_documents_count(self, project_id: int) -> int:
+        return (
+            self.db.query(ArchiveDocument)
+            .filter(ArchiveDocument.project_id == project_id)
+            .count()
+        )
+
+    def _packages_count(self, project_id: int) -> int:
+        return (
+            self.db.query(Package).filter(Package.project_id == project_id).count()
+        )
 
     def _load_summary(self, project) -> None:
         archive_count = (
@@ -550,12 +618,14 @@ class ProjectWindow(QWidget):
                 self.links_table.setItem(row, column, QTableWidgetItem(value))
 
     def _selected_document_quiet(self):
-        """Выбранный документ или None без показания сообщений."""
-        row = self.documents_table.currentRow()
-        documents = document_service.list_documents(self.db, self.project_id)
-        if row < 0 or row >= len(documents):
+        """Документ, выбранный в дереве, или None без показания сообщений."""
+        items = self.document_tree.selectedItems()
+        if not items:
             return None
-        return documents[row]
+        document_id = items[0].data(0, _DOCUMENT_ID_ROLE)
+        if document_id is None:
+            return None
+        return self.db.get(Document, document_id)
 
     def add_link(self) -> None:
         """Связать выбранный документ с файлом архива (ТЗ п.45, 47, 48)."""
@@ -645,16 +715,23 @@ class ProjectWindow(QWidget):
         self._load_sections(service.get_project(self.db, self.project_id))
 
     def add_document(self) -> None:
-        """Создать документ с предложенным номером (ТЗ п.42)."""
-        labels = list(domain.DOC_TYPE_LABELS.values())
-        choice, ok = QInputDialog.getItem(
-            self, "Новый документ", "Вид документа:", labels, 0, False
-        )
-        if not ok:
-            return
-        doc_type = next(
-            value for value, label in domain.DOC_TYPE_LABELS.items() if label == choice
-        )
+        """Создать документ с предложенным номером (ТЗ п.42).
+
+        Если в дереве выбран вид, документ создаётся сразу в нём; иначе вид
+        уточняется. Пустой раздел вида в дереве — рабочий (ТЗ п.16).
+        """
+        doc_type = self._selected_doc_type()
+        if doc_type is None:
+            labels = list(domain.DOC_TYPE_LABELS.values())
+            choice, ok = QInputDialog.getItem(
+                self, "Новый документ", "Вид документа:", labels, 0, False
+            )
+            if not ok:
+                return
+            doc_type = next(
+                value for value, label in domain.DOC_TYPE_LABELS.items()
+                if label == choice
+            )
         dialog = DocumentDialog(self.db, self.project_id, doc_type=doc_type, parent=self)
         try:
             values = self._document_values(dialog)
@@ -663,8 +740,15 @@ class ProjectWindow(QWidget):
             return
         if values is None:
             return
+        if values["doc_type"] != doc_type:
+            # Вид уточнён в диалоге: создаём в выбранном там виде.
+            doc_type = values["doc_type"]
         try:
-            document = document_service.create_document(self.db, self.project_id, **values)
+            document = document_service.create_document(
+                self.db, self.project_id,
+                doc_type=doc_type, number=values["number"],
+                doc_date=values["doc_date"],
+            )
         except document_service.DocumentNumberError as exc:
             QMessageBox.warning(self, "Документ не создан", str(exc))
             return
@@ -676,6 +760,32 @@ class ProjectWindow(QWidget):
         )
         self.db.commit()
         self.reload()
+        self._select_document(document.id)
+
+    def _selected_doc_type(self) -> str | None:
+        """Вид документа, выбранный в дереве (строка вида или документ)."""
+        items = self.document_tree.selectedItems()
+        if not items:
+            return None
+        item = items[0]
+        if item.data(0, _DOCUMENT_ID_ROLE) is not None:
+            document = self.db.get(Document, item.data(0, _DOCUMENT_ID_ROLE))
+            return document.doc_type if document else None
+        for doc_type, label in domain.DOC_TYPE_LABELS.items():
+            if item.text(0) == label:
+                return doc_type
+        return None
+
+    def _select_document(self, document_id: int) -> None:
+        """Выделить документ в дереве после создания или правки."""
+        root = self.document_tree.invisibleRootItem()
+        for top_index in range(root.childCount()):
+            top = root.child(top_index)
+            for index in range(top.childCount()):
+                child = top.child(index)
+                if child.data(0, _DOCUMENT_ID_ROLE) == document_id:
+                    self.document_tree.setCurrentItem(child)
+                    return
 
     def edit_document(self) -> None:
         """Изменить номер и дату документа (ТЗ п.42, 43)."""
@@ -734,14 +844,17 @@ class ProjectWindow(QWidget):
         return dialog.values()
 
     def _selected_document(self):
-        row = self.documents_table.currentRow()
-        documents = document_service.list_documents(self.db, self.project_id)
-        if row < 0 or row >= len(documents):
+        document = self._selected_document_quiet()
+        if document is None:
             QMessageBox.information(
-                self, "Выберите документ", "Сначала выберите документ в перечне."
+                self, "Выберите документ",
+                "Сначала выберите документ в дереве видов (ТЗ п.16).",
             )
-            return None
-        return documents[row]
+        return document
+
+    def _on_tree_selection(self) -> None:
+        """Выбор документа в дереве перерисовывает его связи."""
+        self._reload_links()
 
     def delete_section(self) -> None:
         row = self.sections_table.currentRow()
