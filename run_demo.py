@@ -498,10 +498,26 @@ def main() -> int:
     check("документы проекта удалены каскадом",
           db.query(Document).count() == 0)
 
+    # --- Интернет-ИИ: контракт и честная неготовность (ТЗ п.101) ---
+    from app.ai.connector import MODE_INTERNET, build_internet_provider
+    from app.ai.secrets import GIGACHAT_KEY, STORE
+
+    provider = build_internet_provider()
+    internet = AIConnector(mode=MODE_INTERNET, provider=provider)
+    internet_result = internet.analyze({"request": "Проверь комплект", "documents": []})
+    if provider is None:
+        check("интернет-ИИ без ключа сообщает not_configured (ТЗ п.101)",
+              internet_result["status"] == "not_configured"
+              and internet_result["proposals"] == [])
+        check("ключ GigaChat не задан", STORE.get(GIGACHAT_KEY) is None)
+    else:
+        check("интернет-ИИ настроен на GigaChat", provider.configured())
+
     db.close()
 
-    print("\n=== НЕ РЕАЛИЗОВАНО ===")
-    print("  - интернет-ИИ без настроенной модели сообщает not_configured (п.101)")
+    print("\n=== ЧТО ОСТАЁТСЯ ЗА ПРЕДЕЛАМИ ПРИЛОЖЕНИЯ ===")
+    print("  - фактический вызов GigaChat: нужен ключ авторизации, выданный "
+          "Сбером; запросы выполняются только из интернет-режима")
 
     if FAILURES:
         print(f"\n=== ПРОВЕРКА НЕ ПРОЙДЕНА: {len(FAILURES)} ===")

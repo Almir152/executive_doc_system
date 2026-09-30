@@ -70,3 +70,19 @@ def set_form_open_mode(mode: str) -> None:
     if mode not in FORM_MODES:
         raise ValueError(f"Неизвестный режим открытия формы: {mode}")
     set_setting("form_open_mode", mode)
+
+
+# Режим работы ИИ (ТЗ п.9). Значение переживает перезапуск: оператор
+# не должен заново подтверждать способ обработки данных при каждом входе.
+AI_MODE_KEY = "ai_mode"
+
+
+def ai_mode(default: str = "OFF") -> str:
+    """Сохранённый режим ИИ; неизвестное значение не ломает запуск."""
+    mode = _read().get(AI_MODE_KEY)
+    return mode if isinstance(mode, str) and mode else default
+
+
+def set_ai_mode(mode: str) -> None:
+    """Запомнить выбранный режим ИИ (ТЗ п.9)."""
+    set_setting(AI_MODE_KEY, mode)

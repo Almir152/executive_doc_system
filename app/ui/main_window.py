@@ -16,8 +16,12 @@ from app.db.database import (
     SessionLocal, init_db, pending_update_migrations, release_database,
 )
 from app.db.models import Direction, Project
-from app.ai import normative
-from app.ai.connector import AIConnector, MODE_INTERNET, MODE_LABELS, MODE_ORDER
+from app import settings
+from app.ai import normative, secrets as secret_store
+from app.ai.connector import (
+    AIConnector, MODE_INTERNET, MODE_LABELS, MODE_LOCAL, MODE_ORDER,
+    build_internet_provider,
+)
 from app.core.services import ai_service, backup_service, storage_service
 from app.core.services.storage_service import (
     ARCHIVE_CATEGORIES, ARCHIVE_CATEGORY_DEFAULT, StorageError, add_file_to_archive,
@@ -64,7 +68,15 @@ class MainWindow(QMainWindow):
         # обновление не должно уничтожить проекты и документы (ТЗ п.97, 98).
         self.update_report = self.prepare_database()
         self.db = SessionLocal()
-        self.ai = AIConnector(mode="LOCAL")
+        # Режим ИИ переживает перезапуск (ТЗ п.9, 101).
+        self.secrets = secret_store.STORE
+        self.secrets.migrate_plain_to_dpapi(secret_store.GIGACHAT_KEY)
+        self.ai = AIConnector(
+            # Первый запуск начинает с локального ИИ: наружу ничего не
+            # отправляется, пока оператор не выбрал интернет-режим (ТЗ п.9).
+            mode=settings.ai_mode(MODE_LOCAL),
+            provider=build_internet_provider(),
+        )
 
         self.norms_data = [
             {"code": "СП 48.13330.2019", "title": "Организация строительства", "category": "Свод правил"},
@@ -408,6 +420,49 @@ class MainWindow(QMainWindow):
         self.ai_status_label = QLabel()
         self.ai_status_label.setStyleSheet("font-weight: bold;")
         form_ai.addRow("Состояние:", self.ai_status_label)
+
+        # ТЗ п.101: интернет-ИИ — внешний сервис, у него есть адрес,
+        # модель и ключ доступа. Без них режим честно остаётся
+        # ненастроенным, а не изображает работу.
+        from app.ai.gigachat import (
+            DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_SCOPE,
+        )
+
+        self.ai_base_url_edit = QLineEdit(
+            settings.get_setting("gigachat_base_url", DEFAULT_BASE_URL)
+        )
+        form_ai.addRow("Адрес сервиса:", self.ai_base_url_edit)
+        self.ai_model_edit = QLineEdit(
+            settings.get_setting("gigachat_model", DEFAULT_MODEL)
+        )
+        form_ai.addRow("Модель:", self.ai_model_edit)
+        self.ai_scope_edit = QLineEdit(
+            settings.get_setting("gigachat_scope", DEFAULT_SCOPE)
+        )
+        form_ai.addRow("Область доступа (scope):", self.ai_scope_edit)
+        self.ai_key_edit = QLineEdit()
+        self.ai_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ai_key_edit.setPlaceholderText(
+            "Ключ авторизации GigaChat (сохраняется в защищённом хранилище)"
+        )
+        form_ai.addRow("Ключ GigaChat:", self.ai_key_edit)
+        self.ai_key_state = QLabel()
+        self.ai_key_state.setWordWrap(True)
+        form_ai.addRow("Хранение ключа:", self.ai_key_state)
+
+        ai_buttons = QHBoxLayout()
+        save_ai = QPushButton("Сохранить параметры ИИ")
+        save_ai.clicked.connect(self.save_ai_settings)
+        ai_buttons.addWidget(save_ai)
+        check_ai = QPushButton("Проверить подключение")
+        check_ai.clicked.connect(self.check_ai_connection)
+        ai_buttons.addWidget(check_ai)
+        forget_ai = QPushButton("Забыть ключ")
+        forget_ai.clicked.connect(self.forget_ai_key)
+        ai_buttons.addWidget(forget_ai)
+        form_ai.addRow(ai_buttons)
+
+        self.refresh_ai_key_state()
         self.on_ai_mode_changed(self.ai_mode_combo.currentIndex())
         layout.addWidget(group_ai)
         layout.addStretch()
@@ -621,9 +676,91 @@ class MainWindow(QMainWindow):
                 self.norms_table.setItem(row, 2, QTableWidgetItem(n["category"]))
 
     def on_ai_mode_changed(self, index: int):
-        """ТЗ п.9: переключение режима ИИ и индикация состояния."""
+        """ТЗ п.9: переключение режима ИИ и индикация состояния.
+
+        Выбранный режим сохраняется: обработка данных не должна
+        молча возвращаться к другой при следующем запуске.
+        """
         self.ai.mode = MODE_ORDER[index]
+        settings.set_ai_mode(self.ai.mode)
         self.refresh_ai_state()
+
+    def save_ai_settings(self):
+        """Сохранить адрес, модель, область доступа и ключ (ТЗ п.101)."""
+        from app.ai import secrets as secret_store
+
+        settings.set_setting("gigachat_base_url",
+                             self.ai_base_url_edit.text().strip())
+        settings.set_setting("gigachat_model", self.ai_model_edit.text().strip())
+        settings.set_setting("gigachat_scope", self.ai_scope_edit.text().strip())
+        entered = self.ai_key_edit.text().strip()
+        if entered:
+            backend = self.secrets.set(secret_store.GIGACHAT_KEY, entered)
+            self.ai_key_edit.clear()
+            self.ai_key_state.setText(
+                "Ключ сохранён средствами Windows."
+                if backend == secret_store.BACKEND_DPAPI
+                else "Ключ сохранён открытым в файле настроек — это небезопасно, "
+                     "замените способ хранения или удалите ключ."
+            )
+        self.refresh_ai_key_state()
+        self.ai.provider = build_internet_provider()
+        self.refresh_ai_state()
+
+    def refresh_ai_key_state(self):
+        """Показать, где хранится ключ и чем это грозит (ТЗ п.101)."""
+        from app.ai import secrets as secret_store
+
+        status = self.secrets.status(secret_store.GIGACHAT_KEY)
+        if not status["present"]:
+            text = "Ключ не задан."
+        else:
+            names = {
+                secret_store.BACKEND_DPAPI: "защищённое хранилище Windows (DPAPI)",
+                secret_store.BACKEND_ENV: "переменная окружения",
+                secret_store.BACKEND_PLAIN: "открытый файл настроек",
+            }
+            text = f"Ключ сохранён: {names.get(status['backend'], 'неизвестно')}."
+        if status["warnings"]:
+            text += " " + " ".join(status["warnings"])
+        self.ai_key_state.setText(text)
+
+    def forget_ai_key(self):
+        """Удалить ключ: без него интернет-ИИ работать не сможет."""
+        from app.ai import secrets as secret_store
+
+        self.secrets.forget(secret_store.GIGACHAT_KEY)
+        self.ai_key_edit.clear()
+        self.ai.provider = build_internet_provider()
+        self.refresh_ai_key_state()
+        self.refresh_ai_state()
+
+    def check_ai_connection(self):
+        """Проверить ключ и доступность модели до рабочего запроса."""
+        from app.ai.gigachat import GigaChatConfig, GigaChatError, GigaChatProvider
+        from app.ai import secrets as secret_store
+
+        self.save_ai_settings()
+        config = GigaChatConfig(
+            base_url=self.ai_base_url_edit.text().strip(),
+            model=self.ai_model_edit.text().strip(),
+            scope=self.ai_scope_edit.text().strip(),
+        )
+        provider = GigaChatProvider(
+            config, self.secrets.get(secret_store.GIGACHAT_KEY)
+        )
+        if not provider.configured():
+            QMessageBox.warning(
+                self, "ИИ-агент",
+                "Задайте модель и ключ авторизации GigaChat.",
+            )
+            return
+        try:
+            answer = provider.ask("Ответь одним словом: готовность проверена.")
+        except GigaChatError as exc:
+            QMessageBox.critical(self, "ИИ-агент", str(exc))
+            return
+        QMessageBox.information(self, "ИИ-агент", f"Соединение установлено.\n{answer}")
 
     def refresh_ai_state(self):
         """Обновить индикацию и видимость чата ИИ (ТЗ п.9)."""

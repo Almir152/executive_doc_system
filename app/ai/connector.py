@@ -144,3 +144,20 @@ class AIConnector:
             "document_ids": list(document_ids or []),
             "proposals": [],
         }
+
+
+def build_internet_provider():
+    """Провайдер для интернет-режима по сохранённым настройкам.
+
+    Возвращает ``None``, если ключ или модель не заданы: тогда коннектор
+    честно сообщает о ненастроенном ИИ, а не обращается наружу (ТЗ п.101).
+    """
+    from app.ai.gigachat import GigaChatConfig, GigaChatProvider
+    from app.ai.secrets import GIGACHAT_KEY, STORE
+
+    key = STORE.get(GIGACHAT_KEY)
+    config = GigaChatConfig.from_settings()
+    if not key and not config.model:
+        return None
+    provider = GigaChatProvider(config, key)
+    return provider if provider.configured() else None

@@ -279,3 +279,80 @@ def test_ai_internet_mode_blocks_file_text(
 
     assert warnings, "интернет-режим должен отказать"
     assert "интернет" in warnings[0].lower()
+
+
+# =====================================================================
+# Настройки интернет-ИИ (ТЗ п.101)
+# =====================================================================
+
+
+def test_ai_settings_save_key_and_rebuild_provider(
+    db, monkeypatch, gui_support
+):
+    """Ключ сохраняется через хранилище секретов, а не в настроек-текстом."""
+    from app.ai import secrets as secret_store
+    from app.ui.main_window import MainWindow
+
+    monkeypatch.delenv(secret_store.ENV_KEY, raising=False)
+    monkeypatch.setattr(
+        secret_store, "dpapi_available", lambda: True
+    )
+    monkeypatch.setattr(secret_store, "_dpapi_protect", lambda data: b"cipher:" + data)
+    monkeypatch.setattr(
+        secret_store, "_dpapi_unprotect",
+        lambda payload: payload[len(b"cipher:"):],
+    )
+    window = MainWindow()
+    window.ai_base_url_edit.setText("https://api.giga.chat/v1")
+    window.ai_model_edit.setText("GigaChat-Pro")
+    window.ai_scope_edit.setText("GIGACHAT_API_CORP")
+    window.ai_key_edit.setText("ключ-из-интерфейса")
+
+    window.save_ai_settings()
+
+    # Поле ввода очищается: ключ не остаётся лежать в форме.
+    assert window.ai_key_edit.text() == ""
+    assert secret_store.STORE.get(secret_store.GIGACHAT_KEY) == "ключ-из-интерфейса"
+    assert secret_store.STORE.status(secret_store.GIGACHAT_KEY)["protected"]
+    assert "защищённое хранилище" in window.ai_key_state.text()
+    # Провайдер собран из сохранённых настроек.
+    assert window.ai.provider is not None
+    assert window.ai.provider.config.model == "GigaChat-Pro"
+    window.close()
+
+
+def test_ai_settings_refuse_empty_key_and_report_status(db, monkeypatch, gui_support):
+    """Пустой ключ не сохраняется, а «Забыть ключ» удаляет сохранённый."""
+    from app.ai import secrets as secret_store
+    from app.ui.main_window import MainWindow
+
+    monkeypatch.delenv(secret_store.ENV_KEY, raising=False)
+    window = MainWindow()
+    window.ai_key_edit.setText("временный-ключ")
+    window.save_ai_settings()
+    assert secret_store.STORE.get(secret_store.GIGACHAT_KEY) == "временный-ключ"
+
+    window.forget_ai_key()
+
+    assert secret_store.STORE.get(secret_store.GIGACHAT_KEY) is None
+    assert window.ai.provider is None
+    assert "Ключ не задан" in window.ai_key_state.text()
+    window.close()
+
+
+def test_ai_mode_is_restored_after_restart(db, gui_support):
+    """Выбранный режим ИИ переживает перезапуск (ТЗ п.9)."""
+    from app import settings
+    from app.ui.main_window import MainWindow
+
+    settings.set_ai_mode(MODE_INTERNET)
+    window = MainWindow()
+    try:
+        assert window.ai.mode == MODE_INTERNET
+        assert (
+            window.ai_mode_combo.currentText()
+            == "Интернет-ИИ"
+        )
+    finally:
+        window.close()
+        settings.set_ai_mode(MODE_LOCAL)
