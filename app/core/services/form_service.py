@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import domain
+from app.core.services import issue_service
 from app.db.models import Document, DocumentVersion, NormativeForm, SignatureBlock
 
 BLOCK_HANDED_OVER = "Сдал"
@@ -99,8 +100,12 @@ def set_exploitation_missing_choice(db: Session, document_id: int, choice: str) 
     return choice
 
 
-def _draft_version(db: Session, document_id: int) -> DocumentVersion | None:
-    """Текущая рабочая версия документа (невыпущенная)."""
+def draft_version(db: Session, document_id: int) -> DocumentVersion | None:
+    """Текущая рабочая версия документа (невыпущенная).
+
+    Выпущенная версия рабочей не является: после выпуска правится новая
+    (ТЗ п.85, 93).
+    """
     return db.scalar(
         select(DocumentVersion)
         .where(
@@ -127,7 +132,7 @@ def actual_version(db: Session, document_id: int) -> DocumentVersion | None:
         )
         .order_by(DocumentVersion.version_no.desc())
     )
-    return issued if issued is not None else _draft_version(db, document_id)
+    return issued if issued is not None else draft_version(db, document_id)
 
 
 def actual_payload(db: Session, document_id: int) -> dict:
@@ -322,9 +327,12 @@ def save_draft(
                 "Форма заполнена не полностью:\n• " + "\n• ".join(problems)
             )
 
-    version = _draft_version(db, document_id)
+    version = draft_version(db, document_id)
     if version is None:
-        next_no = 1
+        # Номер продолжает последовательность версий, а не начинается с
+        # единицы: после выпуска черновика уже нет, и version_no=1 конфликтовал
+        # бы с зафиксированной версией (ТЗ п.91).
+        next_no = issue_service.next_version_no(db, document_id)
         version = DocumentVersion(
             document_id=document_id, version_no=next_no, payload={}
         )
@@ -346,7 +354,7 @@ def save_draft(
 
 def load_draft(db: Session, document_id: int) -> dict:
     """Данные незавершённой формы или пустой набор (ТЗ п.66)."""
-    version = _draft_version(db, document_id)
+    version = draft_version(db, document_id)
     return dict(version.payload) if version is not None else {}
 
 

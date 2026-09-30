@@ -17,7 +17,8 @@ from PyQt6.QtWidgets import (
 
 from app import settings
 from app.core import domain
-from app.core.services import document_service, form_service, link_service
+from app.core.services import document_service, form_service, issue_service
+from app.core.services import link_service
 from app.core.services import project_service as service
 from app.db.models import (
     ArchiveDocument, Document, Organization, Package,
@@ -107,6 +108,62 @@ class DocumentDialog(QDialog):
             "number": self.number_edit.text(),
             "doc_date": parse_ru_date(self.date_edit.text()),
         }
+
+
+class IssueDialog(QDialog):
+    """Подтверждение выпуска с вводом даты. ТЗ п.43, 85.
+
+    Дата не подставляется: система не имеет права назначать дату документа
+    (ТЗ п.43), поэтому поле пустое, если оператор ещё не вводил её в
+    реквизитах.
+    """
+
+    def __init__(self, document, parent=None):
+        super().__init__(parent)
+        self.document = document
+        self.setWindowTitle("Выпуск документа")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        heading = QLabel(
+            f"Документ: {document.type_label} № {document.number}"
+        )
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+
+        note = QLabel(
+            "После выпуска версия фиксируется и не изменяется (ТЗ п.85). "
+            "Правки возможны только в новой редакции."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        form = QFormLayout()
+        self.date_edit = QLineEdit(
+            document.doc_date.strftime("%d.%m.%Y") if document.doc_date else ""
+        )
+        self.date_edit.setPlaceholderText("дд.мм.гггг")
+        self.date_edit.setToolTip(
+            "Дата вводится оператором и не изменяется системой (ТЗ п.43)."
+        )
+        form.addRow("Дата документа *", self.date_edit)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def doc_date(self) -> date:
+        """Дата выпуска; пустое поле — ошибка, а не «сегодня» (ТЗ п.43)."""
+        parsed = parse_ru_date(self.date_edit.text())
+        if parsed is None:
+            raise ValueError(
+                "Укажите дату документа: она вводится оператором (ТЗ п.43)."
+            )
+        return parsed
 
 
 def parse_ru_date(text: str) -> date | None:
@@ -264,6 +321,16 @@ class ProjectWindow(QWidget):
         self.btn_close_form.clicked.connect(self.close_form)
         self.btn_close_form.setEnabled(False)
         doc_buttons.addWidget(self.btn_close_form)
+        # ТЗ п.85: выпуск фиксирует версию, новая редакция открывает
+        # следующую. Обе операции доступны только для выбранного документа.
+        self.btn_issue_document = QPushButton("Выпустить документ")
+        self.btn_issue_document.clicked.connect(self.issue_document)
+        self.btn_issue_document.setEnabled(False)
+        doc_buttons.addWidget(self.btn_issue_document)
+        self.btn_new_revision = QPushButton("Новая редакция")
+        self.btn_new_revision.clicked.connect(self.start_revision)
+        self.btn_new_revision.setEnabled(False)
+        doc_buttons.addWidget(self.btn_new_revision)
         doc_buttons.addStretch()
         documents_layout.addLayout(doc_buttons)
 
@@ -495,6 +562,7 @@ class ProjectWindow(QWidget):
         )
 
         self.documents_hint.setVisible(not documents)
+        self._update_document_buttons()
 
     def _archive_documents_count(self, project_id: int) -> int:
         return (
@@ -907,10 +975,76 @@ class ProjectWindow(QWidget):
     def _on_tree_selection(self) -> None:
         """Выбор документа в дереве перерисовывает его связи."""
         self._reload_links()
+        self._update_document_buttons()
 
     # -----------------------------------------------------------------
-    # ФОРМА ДОКУМЕНТА (ТЗ п.63, 64, 65, 66)
+    # ВЫПУСК ДОКУМЕНТА (ТЗ п.85, 93)
     # -----------------------------------------------------------------
+    def _update_document_buttons(self) -> None:
+        """Разрешить выпуск рабочему документу, новую редакцию — выпущенному."""
+        document = self._selected_document_quiet()
+        issued = document is not None and document.status == domain.DOC_STATUS_ISSUED
+        self.btn_issue_document.setEnabled(document is not None and not issued)
+        self.btn_new_revision.setEnabled(issued)
+
+    def issue_document(self) -> None:
+        """Выпустить документ: зафиксировать версию (ТЗ п.85).
+
+        Незаполненные обязательные поля (ТЗ п.96) показываются списком, и
+        выпуск не происходит: зафиксировать неполный документ нельзя.
+        """
+        document = self._selected_document()
+        if document is None:
+            return
+        dialog = IssueDialog(document, parent=self)
+        try:
+            doc_date = dialog.doc_date()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Не выпущено", str(exc))
+            return
+        try:
+            version = issue_service.issue_document(
+                self.db, document.id, doc_date=doc_date
+            )
+        except issue_service.IssueError as exc:
+            QMessageBox.warning(self, "Документ не выпущен", exc.report())
+            return
+        QMessageBox.information(
+            self,
+            "Документ выпущен",
+            f"Зафиксирована версия {version.version_no} документа "
+            f"«{document.type_label} № {document.number}» (ТЗ п.85). "
+            "Изменить её нельзя; для правок начните новую редакцию.",
+        )
+        self.reload()
+        self._select_document(document.id)
+
+    def start_revision(self) -> None:
+        """Начать новую редакцию выпущенного документа (ТЗ п.93)."""
+        document = self._selected_document()
+        if document is None:
+            return
+        if document.status != domain.DOC_STATUS_ISSUED:
+            QMessageBox.information(
+                self, "Редакция не требуется",
+                f"«{document.type_label} № {document.number}» ещё не выпущен, "
+                "документ и так рабочий (ТЗ п.85).",
+            )
+            return
+        try:
+            version = issue_service.start_revision(self.db, document.id)
+        except issue_service.IssueError as exc:
+            QMessageBox.warning(self, "Новая редакция не создана", exc.report())
+            return
+        self.reload()
+        self._select_document(document.id)
+        QMessageBox.information(
+            self, "Новая редакция",
+            f"Создана версия {version.version_no} для правки. "
+            f"Выпущенная версия {version.version_no - 1} остаётся в истории "
+            "без изменений (ТЗ п.93).",
+        )
+
     def open_form(self) -> None:
         """Открыть форму выбранного документа (ТЗ п.65).
 
@@ -919,6 +1053,14 @@ class ProjectWindow(QWidget):
         """
         document = self._selected_document()
         if document is None:
+            return
+        if document.status == domain.DOC_STATUS_ISSUED:
+            QMessageBox.information(
+                self, "Документ выпущен",
+                f"«{document.type_label} № {document.number}» выпущен: его "
+                "версия зафиксирована и не изменяется (ТЗ п.85). "
+                "Чтобы продолжить работу, начните новую редакцию.",
+            )
             return
         if self.form_panel is not None and self.form_panel.document_id != document.id:
             if not self._close_form_confirmed():
