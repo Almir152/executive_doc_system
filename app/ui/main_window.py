@@ -6,7 +6,8 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QTextEdit, QMessageBox, QStackedWidget, QFileDialog,
-    QLineEdit, QFormLayout, QComboBox, QGroupBox
+    QLineEdit, QFormLayout, QComboBox, QGroupBox, QScrollArea,
+    QDialog, QDialogButtonBox,
 )
 from PyQt6 import sip
 from PyQt6.QtCore import Qt
@@ -391,7 +392,7 @@ class MainWindow(QMainWindow):
 
         self.ai_output = QTextEdit()
         self.ai_output.setReadOnly(True)
-        self.ai_output.setMaximumHeight(110)
+        self.ai_output.setMaximumHeight(160)
         layout.addWidget(self.ai_output)
 
         # ТЗ п.103: ИИ получает только то, что оператор отметил. Передача
@@ -424,9 +425,15 @@ class MainWindow(QMainWindow):
         )
         self.ai_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.ai_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        # Полный текст предложения не помещается в колонку: двойной щелчок
+        # открывает его в отдельном окне.
+        self.ai_table.itemDoubleClicked.connect(self._on_ai_proposal_double_clicked)
         layout.addWidget(self.ai_table)
 
         actions = QHBoxLayout()
+        self.btn_view_proposal = QPushButton("Открыть предложение…")
+        self.btn_view_proposal.clicked.connect(self.show_ai_proposal)
+        actions.addWidget(self.btn_view_proposal)
         self.btn_apply_proposal = QPushButton("Применить предложение")
         self.btn_apply_proposal.clicked.connect(self.apply_ai_proposal)
         actions.addWidget(self.btn_apply_proposal)
@@ -441,7 +448,16 @@ class MainWindow(QMainWindow):
 
     def create_settings_page(self):
         page = QWidget()
-        layout = QVBoxLayout(page)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        # Разделов много: на небольшом экране и при масштабировании окна
+        # содержимое должно прокручиваться, а не обрезаться.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
 
         group_storage = QGroupBox("Локальное хранилище (Windows/Linux совместимо)")
         form_storage = QFormLayout(group_storage)
@@ -544,17 +560,17 @@ class MainWindow(QMainWindow):
         self.ai_key_state.setWordWrap(True)
         form_ai.addRow("Хранение ключа:", self.ai_key_state)
 
-        ai_buttons = QHBoxLayout()
+        # Кнопки идут отдельными строками: при масштабировании экрана на
+        # Windows их длинные подписи налезали друг на друга в одной строке.
         save_ai = QPushButton("Сохранить параметры ИИ")
         save_ai.clicked.connect(self.save_ai_settings)
-        ai_buttons.addWidget(save_ai)
+        form_ai.addRow(save_ai)
         check_ai = QPushButton("Проверить подключение")
         check_ai.clicked.connect(self.check_ai_connection)
-        ai_buttons.addWidget(check_ai)
+        form_ai.addRow(check_ai)
         forget_ai = QPushButton("Забыть ключ")
         forget_ai.clicked.connect(self.forget_ai_key)
-        ai_buttons.addWidget(forget_ai)
-        form_ai.addRow(ai_buttons)
+        form_ai.addRow(forget_ai)
 
         self.refresh_ai_key_state()
         self.on_ai_mode_changed(self.ai_mode_combo.currentIndex())
@@ -1370,6 +1386,57 @@ class MainWindow(QMainWindow):
         if item is None:
             return None
         return item.data(Qt.ItemDataRole.UserRole)
+
+    def _on_ai_proposal_double_clicked(self, item) -> None:
+        """Двойной щелчок по строке открывает полный текст предложения."""
+        self.show_ai_proposal()
+
+    def show_ai_proposal(self) -> None:
+        """Показать полный текст предложения ИИ отдельным окном (ТЗ п.105).
+
+        В таблице колонка узкая, и длинное предложение обрезается. Отдельное
+        окно прокручивается, поэтому текст читается целиком.
+        """
+        from app.db.models import AiProposal
+
+        proposal_id = self._selected_ai_proposal_id()
+        if proposal_id is None:
+            QMessageBox.information(
+                self, "Предложение ИИ",
+                "Сначала выберите строку с предложением в таблице (ТЗ п.104).",
+            )
+            return
+        proposal = self.db.get(AiProposal, proposal_id)
+        if proposal is None:
+            QMessageBox.warning(self, "Предложение ИИ", "Предложение не найдено.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Предложение ИИ: {proposal.code}")
+        dialog.resize(720, 520)
+        dialog.setMinimumSize(420, 320)
+        layout = QVBoxLayout(dialog)
+
+        body = QTextEdit()
+        body.setReadOnly(True)
+        kind = (
+            "требование нормы" if proposal.is_requirement else "наблюдение"
+        )
+        basis = normative.format_basis(proposal.basis) or "не указано"
+        body.setPlainText(
+            f"{proposal.code}\n"
+            f"Вид: {kind}\n"
+            f"Основание: {basis}\n"
+            f"Статус: {proposal.status}\n\n"
+            f"{proposal.text}"
+        )
+        layout.addWidget(body)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def apply_ai_proposal(self):
         """Подтвердить предложение ИИ и применить через API (ТЗ п.104)."""

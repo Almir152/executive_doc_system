@@ -252,6 +252,26 @@ def test_project_window_reports_deleted_project(db, qapp):
 
 
 @pytest.mark.gui
+def test_project_window_is_scrollable_and_resizable(db, project, qapp):
+    """Рабочее окно прокручивается и свободно меняет размер.
+
+    Замечание приёмки: окно не влезало в экран, не уменьшалось и не
+    прокручивалось, поэтому часть содержимого была недоступна.
+    """
+    from PyQt6.QtWidgets import QScrollArea
+
+    from app.ui.project_window import ProjectWindow
+
+    window = ProjectWindow(db, project.id)
+    window.show()
+    assert window.findChild(QScrollArea) is not None, "нужен ползунок прокрутки"
+    assert window.minimumWidth() <= 700, "окно должно уменьшаться"
+    window.resize(700, 500)
+    assert window.width() == 700
+    window.close()
+
+
+@pytest.mark.gui
 def test_project_window_reload_shows_new_section(db, project, qapp):
     """Добавленный раздел появляется в окне после перезагрузки."""
     from app.ui.project_window import ProjectWindow

@@ -463,7 +463,10 @@ class DocumentFormWindow(QMainWindow):
         self.db = db
         self.document_id = document_id
         self.setWindowTitle("Форма документа (ТЗ п.65)")
-        self.resize(900, 800)
+        # Форма длинная: окно по умолчанию компактное и свободно
+        # уменьшается, а поля и подписи прокручиваются внутри панели.
+        self.resize(760, 600)
+        self.setMinimumSize(560, 400)
         self.panel = DocumentFormPanel(db, document_id, project_id=project_id)
         self.setCentralWidget(self.panel)
 

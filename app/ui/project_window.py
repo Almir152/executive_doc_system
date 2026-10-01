@@ -18,7 +18,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
     QFileDialog, QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox,
-    QPushButton,
+    QPushButton, QScrollArea,
     QTableWidget, QTableWidgetItem, QTextEdit, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -270,7 +270,10 @@ class ProjectWindow(QWidget):
         # окном, сохраняя родителя (ТЗ п.16).
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setWindowTitle("Рабочее окно проекта")
-        self.resize(1000, 700)
+        # Компактный размер по умолчанию: длинный состав проекта доступен
+        # ползунком, а окно можно свободно уменьшать и увеличивать.
+        self.resize(900, 620)
+        self.setMinimumSize(640, 420)
         self.build()
         self.reload()
 
@@ -278,7 +281,16 @@ class ProjectWindow(QWidget):
     # ПОСТРОЕНИЕ
     # -----------------------------------------------------------------
     def build(self) -> None:
-        layout = QVBoxLayout(self)
+        # Всё содержимое окна прокручивается: иначе состав проекта не влезал
+        # в экран, а окно нельзя было уменьшить ниже размера содержимого.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
 
         header = QHBoxLayout()
         self.title_label = QLabel()

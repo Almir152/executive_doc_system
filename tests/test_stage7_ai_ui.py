@@ -183,6 +183,37 @@ def test_normative_basis_is_shown_to_operator(ai_window, db, project):
     assert kind == "требование нормы"
 
 
+@pytest.mark.gui
+def test_ai_proposal_full_text_opens_in_separate_window(
+    ai_window, db, project, ai_documents, monkeypatch
+):
+    """Полный текст предложения читается в отдельном прокручиваемом окне.
+
+    Замечание приёмки: длинное предложение не помещалось в колонку таблицы,
+    и прочитать его было нельзя.
+    """
+    from PyQt6.QtWidgets import QDialog, QTextEdit
+
+    from app.core.services import ai_service
+
+    ai_window.run_ai_check()
+    ai_window.ai_table.selectRow(0)
+    proposal = ai_service.list_proposals(db, project.id)[0]
+
+    captured = {}
+
+    def fake_exec(self):
+        editor = self.findChild(QTextEdit)
+        captured["text"] = editor.toPlainText() if editor is not None else ""
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr("app.ui.main_window.QDialog.exec", fake_exec)
+    ai_window.show_ai_proposal()
+
+    assert proposal.code in captured["text"]
+    assert proposal.text in captured["text"]
+
+
 # =====================================================================
 # П.103: ФАЙЛЫ ПЕРЕДАЮТСЯ ТОЛЬКО ПО ОТМЕТКЕ ОПЕРАТОРА
 # =====================================================================
