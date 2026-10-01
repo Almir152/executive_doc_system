@@ -1,0 +1,95 @@
+name: Release
+
+# Сборка готовых к запуску версий приложения.
+#
+# Запуск:
+#   * автоматически — при публикации тега вида v1.0.0 (создаёт Release с
+#     вложениями для Windows и Linux);
+#   * вручную — Actions -> Release -> Run workflow (артефакты без Release).
+#
+# Сборка под каждую ОС идёт на своей машине: PyInstaller не умеет собирать
+# .exe под Windows на Linux и наоборот.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Сборка
+        run: python -m PyInstaller --clean --noconfirm ExecutiveDocSystem.spec
+
+      - name: Упаковка в ZIP
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          if (-not $ver.StartsWith("v")) { $ver = "v0.0.0" }
+          Compress-Archive -Path "dist/ExecutiveDocSystem/*" `
+            -DestinationPath "ExecutiveDocSystem-$ver-windows-x64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ExecutiveDocSystem-windows-x64
+          path: ExecutiveDocSystem-*-windows-x64.zip
+
+      - name: Публикация Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ExecutiveDocSystem-*-windows-x64.zip
+          generate_release_notes: true
+
+  linux:
+    name: Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Сборка
+        run: python -m PyInstaller --clean --noconfirm ExecutiveDocSystem.spec
+
+      - name: Упаковка в архив
+        run: |
+          ver="${{ github.ref_name }}"
+          case "$ver" in v*) ;; *) ver="v0.0.0" ;; esac
+          tar -C dist/ExecutiveDocSystem -czf "ExecutiveDocSystem-$ver-linux-x86_64.tar.gz" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ExecutiveDocSystem-linux-x86_64
+          path: ExecutiveDocSystem-*-linux-x86_64.tar.gz
+
+      - name: Публикация Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ExecutiveDocSystem-*-linux-x86_64.tar.gz
+          generate_release_notes: true

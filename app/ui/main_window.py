@@ -13,6 +13,7 @@ from PyQt6 import sip
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCloseEvent
 
+from app import __version__
 from app.config import ARCHIVE_DIR, BACKUP_DIR, DATA_DIR, PACKAGES_DIR, ensure_dirs
 from app.core import domain
 from app.db.database import (
@@ -53,7 +54,9 @@ log = logging.getLogger(__name__)
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Единая система управления ИД")
+        self.setWindowTitle(
+            f"Единая система управления ИД — версия {__version__}"
+        )
         self.resize(1150, 750)
         self.project_window = None
 
