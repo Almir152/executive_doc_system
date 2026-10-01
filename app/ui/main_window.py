@@ -219,9 +219,10 @@ class MainWindow(QMainWindow):
         # держать соединение с базой.
         window = ProjectWindow(self.db, project_id, self)
         window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        window.destroyed.connect(
-            lambda _obj=None, ref=window: self._forget_project_window(ref)
-        )
+        # Слот — связанный метод, а не лямбда: замыкание на self в слоте
+        # destroyed переживает разборку окна и обращается к уже освобождённой
+        # переменной, из-за чего падало с NameError при закрытии приложения.
+        window.destroyed.connect(self._on_project_window_destroyed)
         self.project_window = window
         window.show()
 
@@ -237,13 +238,14 @@ class MainWindow(QMainWindow):
             # Объект уничтожен между проверкой и вызовом: ничего не делаем.
             pass
 
-    def _forget_project_window(self, ref) -> None:
+    def _on_project_window_destroyed(self, _obj=None) -> None:
         """Обработать удаление окна проекта после WA_DeleteOnClose.
 
-        Сравнение по идентичности: к моменту сигнала могло быть создано
-        новое окно, и обнулять его ссылку нельзя.
+        Если к моменту сигнала открыто новое окно, старая ссылка уже
+        заменена, и обнулять её нельзя.
         """
-        if self.project_window is ref:
+        window = self.project_window
+        if window is not None and sip.isdeleted(window):
             self.project_window = None
 
     def create_archive_page(self):

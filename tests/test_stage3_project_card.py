@@ -281,6 +281,34 @@ def test_main_window_opens_project_window(db, project, qapp):
 
     assert window.project_window is not None
     assert "Тестовый объект" in window.project_window.title_label.text()
+    # Окно должно быть самостоятельным, а не дочерним виджетом главного:
+    # иначе show() прячет его за центральным виджетом и оператор ничего не
+    # видит (ТЗ п.16).
+    assert window.project_window.isWindow() is True
+    assert window.project_window.isVisible() is True
+    window.close()
+
+
+@pytest.mark.gui
+def test_project_window_can_be_reopened_after_close(db, project, qapp):
+    """Повторное открытие не падает на уже удалённом окне (ТЗ п.16)."""
+    from app.ui.main_window import MainWindow
+
+    window = MainWindow()
+    window.show()
+    window.load_projects()
+    window.projects_table.selectRow(0)
+
+    window.open_project_window()
+    first = window.project_window
+    first.close()
+    qapp.processEvents()
+
+    window.open_project_window()
+
+    assert window.project_window is not None
+    assert window.project_window is not first
+    assert window.project_window.isWindow() is True
     window.close()
 
 

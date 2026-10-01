@@ -263,6 +263,14 @@ class ProjectWindow(QWidget):
         self.db = db
         self.project_id = project_id
         self.form_panel = None
+        # Родитель нужен, чтобы окно принадлежало главному и закрывалось
+        # вместе с ним. Но дочерний виджет с родителем — не отдельное окно:
+        # вызов show() показывал бы его внутри главного за центральным виджетом,
+        # и оператор не видел ничего. Флаг Window делает его самостоятельным
+        # окном, сохраняя родителя (ТЗ п.16).
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.setWindowTitle("Рабочее окно проекта")
+        self.resize(1000, 700)
         self.build()
         self.reload()
 
