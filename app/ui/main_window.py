@@ -336,6 +336,11 @@ class MainWindow(QMainWindow):
         )
         self.forms_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.forms_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        # Выбор строкой: разделы формы должны появляться по щелчку в любом
+        # месте строки, а не только по узкому номеру слева.
+        self.forms_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
         layout.addWidget(self.forms_table)
 
         self.forms_detail = QLabel("")

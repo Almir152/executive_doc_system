@@ -593,3 +593,42 @@ def test_full_official_sample_targets_more_pages_than_short_one():
     official = _definition_by_version(FORM_VERSION_AOSR_OFFICIAL)
     short = _definition_by_version(FORM_VERSION_AOSR_SHORT)
     assert official.layout.target_pages != short.layout.target_pages
+
+
+@pytest.mark.gui
+def test_forms_sections_appear_on_any_cell_click(qapp, db, project, monkeypatch):
+    """Разделы формы видны по щелчку в любом месте строки.
+
+    Раньше таблица выбирала отдельные ячейки, а `selectedRows()` возвращал
+    пусто: состав формы появлялся только по узкому номеру строки слева.
+    """
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+
+    from app.ui.main_window import MainWindow
+
+    monkeypatch.setattr(
+        "app.ui.main_window.QMessageBox.information",
+        lambda *args, **kwargs: None,
+    )
+    window = MainWindow()
+    try:
+        table = window.forms_table
+        assert table.rowCount() > 0, "справочник форм должен быть заполнен"
+        assert (
+            table.selectionBehavior()
+            == table.SelectionBehavior.SelectRows
+        ), "щелчок в любом месте строки должен выделять строку целиком"
+        assert window.forms_detail.text() == ""
+
+        cell = table.visualRect(table.model().index(0, 2))
+        QTest.mouseClick(
+            table.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            cell.center(),
+        )
+        assert len(table.selectionModel().selectedRows()) == 1
+        assert "блоков" in window.forms_detail.text()
+    finally:
+        window.close()
